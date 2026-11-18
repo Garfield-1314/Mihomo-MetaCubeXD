@@ -28,6 +28,11 @@ NET_DNS=${NET_DNS:-}
 TZ=${TZ:-}
 NODE_VERSION=${NODE_VERSION:-22}
 GO_VERSION=${GO_VERSION:-1.26}
+# Router mode turns the AIO image into a self-managed bypass router: one
+# managed base profile, one mihomo proxy-provider per imported subscription,
+# TUN + DNS + forwarding configured automatically. WSL is test-only.
+TUN_STACK=${TUN_STACK:-gvisor}
+ROUTER_MODE=${ROUTER_MODE:-1}
 
 BUILD_LOCAL=1
 NO_BUILD=0
@@ -79,7 +84,8 @@ Options:
 
 Environment:
   APP_DIR, IMAGE_TAG, MIHOMO_TAG, TARGET_PLATFORM, LAN_IP, LAN_CIDR,
-  DATA_VOLUME, NET_IFACE, NET_GATEWAY, NET_DNS, TZ, NODE_VERSION, GO_VERSION
+  DATA_VOLUME, NET_IFACE, NET_GATEWAY, NET_DNS, TZ, NODE_VERSION, GO_VERSION,
+  ROUTER_MODE, TUN_STACK
 EOF
 }
 
@@ -215,7 +221,7 @@ if [[ "$SET_IP" == 1 && "$IS_WSL" == true ]]; then
 fi
 
 apt-get update
-PACKAGES=(ca-certificates curl openssl git iproute2 gzip)
+PACKAGES=(ca-certificates curl openssl git iproute2 iptables gzip)
 if [[ "$DISABLE_WIFI" == 1 ]]; then
   PACKAGES+=(rfkill)
 fi
@@ -387,6 +393,7 @@ detect_lan_pair() {
 if [[ "$IS_WSL" == true ]]; then
   LAN_IP=localhost
   LAN_CIDR=""
+  ROUTER_MODE=0
 else
   if [[ -z "$LAN_IP" && -z "$LAN_CIDR" ]]; then
     detect_lan_pair || true
@@ -452,6 +459,8 @@ IMAGE_TAG=$IMAGE_TAG
 LAN_IP=$LAN_IP
 LAN_CIDR=$LAN_CIDR
 DATA_VOLUME=$DATA_VOLUME
+ROUTER_MODE=$ROUTER_MODE
+TUN_STACK=$TUN_STACK
 TZ=$TZ
 EOF
 chmod 0600 "$APP_DIR/.env"
@@ -524,7 +533,16 @@ services:
       CONTROL_PORT: "8080"
       CLASH_API_PORT: "9090"
       MIXED_PORT: "7890"
+      ROUTER_MODE: ${ROUTER_MODE}
+      LAN_IP: ${LAN_IP}
+      LAN_CIDR: ${LAN_CIDR}
+      TUN_STACK: ${TUN_STACK}
       TZ: ${TZ}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - metacubexd-data:/data
 
@@ -551,7 +569,16 @@ services:
       CONTROL_PORT: "8080"
       CLASH_API_PORT: "9090"
       MIXED_PORT: "7890"
+      ROUTER_MODE: ${ROUTER_MODE}
+      LAN_IP: ${LAN_IP}
+      LAN_CIDR: ${LAN_CIDR}
+      TUN_STACK: ${TUN_STACK}
       TZ: ${TZ}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - metacubexd-data:/data
 
@@ -788,7 +815,13 @@ else
   # Fallback for systems without the Compose v2 plugin (some Raspberry Pi OS
   # images). The runtime flags mirror compose.yaml.
   docker volume create "$DATA_VOLUME" >/dev/null
-  RUN_ARGS=(--name metacubexd --restart unless-stopped)
+  RUN_ARGS=(
+    --name metacubexd
+    --restart unless-stopped
+    --log-driver json-file
+    --log-opt max-size=10m
+    --log-opt max-file=3
+  )
   if [[ "$IS_WSL" == true ]]; then
     RUN_ARGS+=(-p 8080:8080 -p 9090:9090 -p 7890:7890)
   else
@@ -835,13 +868,216 @@ if [[ "$SET_IP" == 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Dashboard merge-profile template
+# Long-running router support (forwarding, health checks, backups)
+# ---------------------------------------------------------------------------
+
+install_router_units() {
+  local iface
+  iface=${NET_IFACE:-$(ip -4 route show default 2>/dev/null | awk '{ print $5; exit }')}
+  if [[ -z "$iface" ]]; then
+    warn "could not determine the LAN interface; skipping forwarding service"
+    return 0
+  fi
+
+  install -d -m 0755 /usr/local/sbin
+  cat > /etc/default/metacubexd-router <<EOF
+# Managed by the MetaCubeXD installer.
+ROUTER_IFACE=$iface
+APP_DIR=$APP_DIR
+EOF
+  chmod 0644 /etc/default/metacubexd-router
+
+  cat > /usr/local/sbin/metacubexd-forward.sh <<'EOF'
+#!/bin/sh
+set -eu
+. /etc/default/metacubexd-router
+IFACE=${ROUTER_IFACE:-}
+if [ -z "$IFACE" ] || ! ip link show "$IFACE" >/dev/null 2>&1; then
+  IFACE=$(ip -4 route show default | awk '{ print $5; exit }')
+fi
+[ -n "$IFACE" ] || exit 0
+
+add_rule() {
+  iptables -C FORWARD "$@" 2>/dev/null || iptables -I FORWARD 1 "$@"
+}
+add_rule -i "$IFACE" -o Meta -j ACCEPT
+add_rule -i Meta -o "$IFACE" -j ACCEPT
+EOF
+  chmod 0755 /usr/local/sbin/metacubexd-forward.sh
+
+  cat > /etc/systemd/system/metacubexd-forward.service <<'EOF'
+[Unit]
+Description=Allow MetaCubeXD TUN forwarding
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/metacubexd-forward.sh
+EOF
+
+  cat > /etc/systemd/system/metacubexd-forward.timer <<'EOF'
+[Unit]
+Description=Re-assert MetaCubeXD TUN forwarding rules
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  cat > /usr/local/sbin/metacubexd-health.sh <<'EOF'
+#!/bin/sh
+set -u
+. /etc/default/metacubexd-router
+APP_DIR=${APP_DIR:-/opt/metacubexd}
+BASE=http://127.0.0.1:8080/api/control
+STATE=/run/metacubexd-health
+mkdir -p "$STATE"
+
+TOKEN=$(sed -n 's/^CONTROL_TOKEN=//p' "$APP_DIR/.env" 2>/dev/null | tail -n1)
+AUTH=""
+[ -n "$TOKEN" ] && AUTH="Authorization: Bearer $TOKEN"
+
+restart_container() {
+  now=$(date +%s)
+  last=$(cat "$STATE/last-restart" 2>/dev/null || echo 0)
+  if [ $((now - last)) -lt 1800 ]; then
+    logger -t metacubexd-health "restart suppressed (cooldown): $1"
+    return 0
+  fi
+  echo "$now" > "$STATE/last-restart"
+  logger -t metacubexd-health "restarting container: $1"
+  docker restart metacubexd >/dev/null 2>&1 || true
+  rm -f "$STATE/health-fail" "$STATE/kernel-fail"
+}
+
+if curl -fsS --max-time 5 "$BASE/health" >/dev/null 2>&1; then
+  rm -f "$STATE/health-fail"
+else
+  n=$(cat "$STATE/health-fail" 2>/dev/null || echo 0)
+  n=$((n + 1))
+  echo "$n" > "$STATE/health-fail"
+  logger -t metacubexd-health "control server health failed ($n/3)"
+  [ "$n" -ge 3 ] && restart_container "control server unhealthy"
+fi
+
+if [ -n "$TOKEN" ]; then
+  status=$(curl -fsS --max-time 5 -H "$AUTH" "$BASE/kernel/status" 2>/dev/null |
+    sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
+  if [ "$status" = "errored" ]; then
+    n=$(cat "$STATE/kernel-fail" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" > "$STATE/kernel-fail"
+    logger -t metacubexd-health "kernel errored ($n/3)"
+    [ "$n" -ge 3 ] && restart_container "kernel errored"
+  else
+    rm -f "$STATE/kernel-fail"
+  fi
+fi
+
+use=$(df -P / 2>/dev/null | awk 'NR==2 { gsub(/%/, "", $5); print $5 }')
+if [ -n "$use" ] && [ "$use" -ge 90 ]; then
+  logger -t metacubexd-health "root filesystem is ${use}% full"
+fi
+EOF
+  chmod 0755 /usr/local/sbin/metacubexd-health.sh
+
+  cat > /etc/systemd/system/metacubexd-health.service <<'EOF'
+[Unit]
+Description=MetaCubeXD health and recovery check
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=/usr/local/sbin/metacubexd-health.sh
+EOF
+
+  cat > /etc/systemd/system/metacubexd-health.timer <<'EOF'
+[Unit]
+Description=Run MetaCubeXD health checks every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  cat > /usr/local/sbin/metacubexd-backup.sh <<'EOF'
+#!/bin/sh
+set -eu
+. /etc/default/metacubexd-router
+APP_DIR=${APP_DIR:-/opt/metacubexd}
+BACKUP_DIR=$APP_DIR/backups
+DATA_VOLUME=$(sed -n 's/^DATA_VOLUME=//p' "$APP_DIR/.env" 2>/dev/null | tail -n1)
+[ -n "$DATA_VOLUME" ] || DATA_VOLUME=metacubexd_metacubexd-data
+VOLUME_PATH=$(docker volume inspect --format '{{ .Mountpoint }}' "$DATA_VOLUME" 2>/dev/null || true)
+[ -n "$VOLUME_PATH" ] || exit 0
+
+mkdir -p "$BACKUP_DIR"
+chmod 0700 "$BACKUP_DIR"
+stamp=$(date +%Y%m%d)
+tar -czf "$BACKUP_DIR/metacubexd-$stamp.tar.gz" \
+  -C "$APP_DIR" .env \
+  -C "$VOLUME_PATH" .
+find "$BACKUP_DIR" -name 'metacubexd-*.tar.gz' -mtime +7 -delete
+EOF
+  chmod 0700 /usr/local/sbin/metacubexd-backup.sh
+
+  cat > /etc/systemd/system/metacubexd-backup.service <<'EOF'
+[Unit]
+Description=Back up MetaCubeXD configuration and data
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=/usr/local/sbin/metacubexd-backup.sh
+EOF
+
+  cat > /etc/systemd/system/metacubexd-backup.timer <<'EOF'
+[Unit]
+Description=Daily MetaCubeXD backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now metacubexd-forward.timer || warn "could not enable forwarding timer"
+  systemctl enable --now metacubexd-health.timer || warn "could not enable health timer"
+  systemctl enable --now metacubexd-backup.timer || warn "could not enable backup timer"
+  echo "Router support: forwarding, health checks, daily backups"
+}
+
+if [[ "$IS_WSL" != true ]]; then
+  install_router_units
+fi
+
+# ---------------------------------------------------------------------------
+# WSL-only CORS helper. Real router deployments get CORS, TUN and DNS from the
+# agent-managed AIO Router base; there is no merge profile to create.
 # ---------------------------------------------------------------------------
 
 if [[ "$IS_WSL" == true ]]; then
   cat > "$APP_DIR/merge-profile.yaml" <<'EOF'
-# Paste this into Dashboard -> Profiles -> New Merge Profile, then activate it.
-# WSL test mode does not enable TUN.
+# Optional for WSL test mode only (no router-mode base there).
+# Paste into Dashboard -> Profiles -> New Merge Profile, then activate it.
 allow-lan: false
 
 external-controller-cors:
@@ -850,43 +1086,8 @@ external-controller-cors:
     - 'http://localhost:8080'
     - 'http://127.0.0.1:8080'
 EOF
-else
-  cat > "$APP_DIR/merge-profile.yaml" <<EOF
-# Paste this into Dashboard -> Profiles -> New Merge Profile, then activate it.
-allow-lan: false
-
-# The dashboard and the Clash API use different ports, so the browser treats
-# them as different origins. Without this the UI may report
-# "Unable to connect to backend".
-external-controller-cors:
-  allow-private-network: true
-  allow-origins:
-    - 'http://${LAN_IP}:8080'
-    - 'http://localhost:8080'
-    - 'http://127.0.0.1:8080'
-
-# If LAN clients use this host as DNS and lookups fail, add a top-level block:
-# dns:
-#   listen: 0.0.0.0:53
-
-tun:
-  enable: true
-  stack: mips
-  auto-route: true
-  auto-redirect: true
-  auto-detect-interface: true
-  route-exclude-address:
-    - ${LAN_CIDR}
-    - 127.0.0.0/8
-    - 169.254.0.0/16
-    - 10.0.0.0/8
-    - 172.16.0.0/12
-  dns-hijack:
-    - any:53
-    - tcp://any:53
-EOF
+  chmod 0640 "$APP_DIR/merge-profile.yaml"
 fi
-chmod 0640 "$APP_DIR/merge-profile.yaml"
 
 # ---------------------------------------------------------------------------
 # Report
@@ -903,15 +1104,18 @@ else
   echo "The Clash API endpoint is http://${LAN_IP}:9090"
 fi
 echo "Clash API secret: $CLASH_SECRET"
-echo "Merge profile template: $APP_DIR/merge-profile.yaml"
 echo
 if [[ "$IS_WSL" != true ]]; then
-  echo "Bypass-router steps:"
-  echo "  1. Import your subscription as a Remote Profile."
-  echo "  2. Create a Merge Profile from $APP_DIR/merge-profile.yaml and activate it."
-  echo "  3. Set the test client's gateway and DNS to ${LAN_IP}."
-  echo "  4. Confirm IPv4 forwarding: sysctl net.ipv4.ip_forward"
-  echo "  5. If DNS fails, test: dig @${LAN_IP} example.com"
+  echo "Bypass-router setup:"
+  echo "  1. Open http://${LAN_IP}:8080"
+  echo "  2. Paste ONE subscription URL and import it."
+  echo "  3. Everything else is automatic: AIO Router, TUN, DNS, rules, groups,"
+  echo "     provider refresh and forwarding."
+  echo "  4. Set clients' gateway and DNS to ${LAN_IP} (or push both from the"
+  echo "     main router's DHCP server)."
+  echo
+  echo "Additional subscriptions: use the same import box. They become extra"
+  echo "provider sources; no merge profile or YAML edit is required."
   echo
   echo "The dashboard has no login. Restrict 8080/9090/7890 to your LAN; do not"
   echo "expose them to the internet. Use a firewall and an authenticated reverse"

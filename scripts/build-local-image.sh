@@ -20,6 +20,8 @@ TARGET_PLATFORM=${TARGET_PLATFORM:-}
 NODE_VERSION=${NODE_VERSION:-22}
 GO_VERSION=${GO_VERSION:-1.26}
 BASE_REGISTRY=${BASE_REGISTRY:-docker.io}
+# Optional Alpine package mirror host, e.g. https://mirrors.aliyun.com
+APK_MIRROR=${APK_MIRROR:-}
 GOPROXY=${GOPROXY:-https://proxy.golang.org,direct}
 NPM_REGISTRY=${NPM_REGISTRY:-https://registry.npmjs.org/}
 NUXT_FONTS_DISABLE_REMOTE=${NUXT_FONTS_DISABLE_REMOTE:-true}
@@ -46,6 +48,7 @@ Options:
 
 Environment:
   BASE_REGISTRY   Docker Hub mirror for base images (default: $BASE_REGISTRY)
+  APK_MIRROR      Alpine package mirror host (default: upstream dl-cdn)
   GOPROXY         Go module proxy (default: $GOPROXY)
   NPM_REGISTRY    npm registry (default: $NPM_REGISTRY)
   NUXT_FONTS_DISABLE_REMOTE
@@ -159,6 +162,7 @@ BUILD_ARGS=(
   --build-arg "NODE_VERSION=$NODE_VERSION"
   --build-arg "GO_VERSION=$GO_VERSION"
   --build-arg "BASE_REGISTRY=$BASE_REGISTRY"
+  --build-arg "APK_MIRROR=$APK_MIRROR"
   --build-arg "GOPROXY=$GOPROXY"
   --build-arg "NPM_REGISTRY=$NPM_REGISTRY"
   --build-arg "NUXT_FONTS_DISABLE_REMOTE=$NUXT_FONTS_DISABLE_REMOTE"
