@@ -23,8 +23,9 @@ ARG GOPROXY=https://proxy.golang.org,direct
 
 ENV GOPROXY=${GOPROXY}
 
-RUN apk add --no-cache ca-certificates git
-
+# The official golang:alpine image already ships ca-certificates. `git` is not
+# required because the build disables VCS stamping and Go modules come from
+# GOPROXY. Keeping this stage network-free makes arm64 cross-builds reliable.
 WORKDIR /src/mihomo
 COPY mihomo/ ./
 
@@ -65,13 +66,20 @@ COPY metacubexd/pnpm-workspace.yaml metacubexd/pnpm-lock.yaml metacubexd/package
 COPY metacubexd/packages/ packages/
 COPY metacubexd/apps/ apps/
 COPY docker/patch-offline-fonts.mjs /tmp/patch-offline-fonts.mjs
+COPY docker/patch-aio-config.mjs /tmp/patch-aio-config.mjs
 
 RUN if [ "$NUXT_FONTS_DISABLE_REMOTE" = "true" ]; then \
       node /tmp/patch-offline-fonts.mjs; \
     fi
 
+RUN node /tmp/patch-aio-config.mjs
+
 RUN pnpm install --frozen-lockfile
 RUN pnpm --filter @metacubexd/ui generate
+# The AIO server injects CONTROL_TOKEN / backend URL / Clash secret through
+# the dynamic /config.js route. Remove the client-side placeholder so the
+# static asset handler cannot shadow that route.
+RUN rm -f packages/ui/.output/public/config.js
 RUN pnpm --filter @metacubexd/server... build
 
 # ---- Stage 3: minimal runtime ----

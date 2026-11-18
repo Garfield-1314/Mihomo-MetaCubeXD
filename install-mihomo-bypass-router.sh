@@ -21,6 +21,10 @@ MIHOMO_TAG=${MIHOMO_TAG:-v1.19.27}
 TARGET_PLATFORM=${TARGET_PLATFORM:-}
 LAN_IP=${LAN_IP:-}
 LAN_CIDR=${LAN_CIDR:-}
+DATA_VOLUME=${DATA_VOLUME:-}
+NET_IFACE=${NET_IFACE:-}
+NET_GATEWAY=${NET_GATEWAY:-}
+NET_DNS=${NET_DNS:-}
 TZ=${TZ:-}
 NODE_VERSION=${NODE_VERSION:-22}
 GO_VERSION=${GO_VERSION:-1.26}
@@ -29,6 +33,10 @@ BUILD_LOCAL=1
 NO_BUILD=0
 NO_CACHE=0
 TAG_SET=0
+SET_IP=0
+DISABLE_WIFI=0
+REBOOT_AFTER=0
+PREVIOUS_IMAGE=""
 IMAGE_REF=""
 ARCHIVE_FILE=""
 
@@ -61,11 +69,17 @@ Options:
   --rebuild             Rebuild without Docker layer cache
   --lan-ip IP           Override the LAN IP used in URLs and CORS
   --lan-cidr CIDR       Override the LAN CIDR excluded from TUN
+  --set-ip              Write a persistent static-IP config (applies on reboot)
+  --interface IFACE     Interface for --set-ip (default: auto-detect)
+  --gateway IP          Gateway for --set-ip (default: current default route)
+  --dns IP              DNS server for --set-ip (default: gateway)
+  --disable-wifi        Disable Wi-Fi persistently when --set-ip is used
+  --reboot              Reboot after writing the static-IP config
   --help                Show this help
 
 Environment:
-  APP_DIR, IMAGE_TAG, MIHOMO_TAG, TARGET_PLATFORM, LAN_IP, LAN_CIDR, TZ,
-  NODE_VERSION, GO_VERSION
+  APP_DIR, IMAGE_TAG, MIHOMO_TAG, TARGET_PLATFORM, LAN_IP, LAN_CIDR,
+  DATA_VOLUME, NET_IFACE, NET_GATEWAY, NET_DNS, TZ, NODE_VERSION, GO_VERSION
 EOF
 }
 
@@ -125,6 +139,33 @@ while [[ $# -gt 0 ]]; do
       LAN_CIDR=$2
       shift 2
       ;;
+    --set-ip)
+      SET_IP=1
+      shift
+      ;;
+    --interface)
+      [[ $# -ge 2 ]] || die "--interface requires a value"
+      NET_IFACE=$2
+      shift 2
+      ;;
+    --gateway)
+      [[ $# -ge 2 ]] || die "--gateway requires a value"
+      NET_GATEWAY=$2
+      shift 2
+      ;;
+    --dns)
+      [[ $# -ge 2 ]] || die "--dns requires a value"
+      NET_DNS=$2
+      shift 2
+      ;;
+    --disable-wifi)
+      DISABLE_WIFI=1
+      shift
+      ;;
+    --reboot)
+      REBOOT_AFTER=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -169,8 +210,15 @@ if grep -qiE '(microsoft|wsl)' /proc/sys/kernel/osrelease 2>/dev/null; then
   IS_WSL=true
 fi
 
+if [[ "$SET_IP" == 1 && "$IS_WSL" == true ]]; then
+  die "--set-ip is not supported in WSL test mode"
+fi
+
 apt-get update
 PACKAGES=(ca-certificates curl openssl git iproute2 gzip)
+if [[ "$DISABLE_WIFI" == 1 ]]; then
+  PACKAGES+=(rfkill)
+fi
 if ! command -v docker >/dev/null 2>&1; then
   PACKAGES+=(docker.io)
 fi
@@ -195,6 +243,32 @@ fi
 
 if ! docker compose version >/dev/null 2>&1; then
   warn "Docker Compose v2 is not available; falling back to docker run."
+fi
+
+# Preserve the existing data volume across upgrades. Older Compose installs
+# used the implicit project prefix (metacubexd_metacubexd-data); fresh installs
+# use the explicit metacubexd-data name.
+if [[ -z "$DATA_VOLUME" && -f "$APP_DIR/.env" ]]; then
+  DATA_VOLUME=$(sed -n 's/^DATA_VOLUME=//p' "$APP_DIR/.env" | tail -n1)
+fi
+if [[ -z "$DATA_VOLUME" ]]; then
+  if docker volume inspect metacubexd_metacubexd-data >/dev/null 2>&1; then
+    DATA_VOLUME=metacubexd_metacubexd-data
+  elif docker volume inspect metacubexd-data >/dev/null 2>&1; then
+    DATA_VOLUME=metacubexd-data
+  else
+    DATA_VOLUME=metacubexd-data
+  fi
+fi
+echo "Data volume: $DATA_VOLUME"
+
+# Keep the currently deployed image available for rollback. This is especially
+# important for archive upgrades: the new archive is loaded under the same tag.
+if [[ -n "$ARCHIVE_FILE" || "$BUILD_LOCAL" == 1 ]] &&
+  docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+  PREVIOUS_IMAGE="${IMAGE_TAG}.previous"
+  docker tag "$IMAGE_TAG" "$PREVIOUS_IMAGE"
+  echo "Previous image saved as: $PREVIOUS_IMAGE"
 fi
 
 if [[ "$IS_WSL" != true ]]; then
@@ -377,6 +451,7 @@ DEFAULT_BACKEND_URL=$DEFAULT_BACKEND_URL
 IMAGE_TAG=$IMAGE_TAG
 LAN_IP=$LAN_IP
 LAN_CIDR=$LAN_CIDR
+DATA_VOLUME=$DATA_VOLUME
 TZ=$TZ
 EOF
 chmod 0600 "$APP_DIR/.env"
@@ -455,6 +530,7 @@ services:
 
 volumes:
   metacubexd-data:
+    name: ${DATA_VOLUME}
 EOF
 else
   cat > "$APP_DIR/compose.yaml" <<'EOF'
@@ -481,9 +557,218 @@ services:
 
 volumes:
   metacubexd-data:
+    name: ${DATA_VOLUME}
 EOF
 fi
 chmod 0640 "$APP_DIR/compose.yaml"
+
+# ---------------------------------------------------------------------------
+# Optional persistent static IP (applied on next boot, not immediately)
+# ---------------------------------------------------------------------------
+
+if [[ "$SET_IP" == 1 ]]; then
+  [[ -n "$LAN_IP" && -n "$LAN_CIDR" ]] ||
+    die "--set-ip requires --lan-ip and --lan-cidr"
+fi
+
+ipv4_to_int() {
+  local ip=$1 a b c d
+  IFS=. read -r a b c d <<<"$ip"
+  [[ "$a" =~ ^[0-9]{1,3}$ && "$b" =~ ^[0-9]{1,3}$ &&
+     "$c" =~ ^[0-9]{1,3}$ && "$d" =~ ^[0-9]{1,3}$ ]] || return 1
+  (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )) || return 1
+  echo $(( (a << 24) | (b << 16) | (c << 8) | d ))
+}
+
+find_iface_for_network() {
+  local target=$1 mask=$2 iface cidr ip chosen=""
+  while read -r iface cidr; do
+    [[ -n "$iface" && "$cidr" == */* ]] || continue
+    ip=${cidr%/*}
+    if (( ( $(ipv4_to_int "$ip") & mask) == target )); then
+      case "$iface" in
+        eth*|end*|en*) echo "$iface"; return 0 ;;
+      esac
+      [[ -z "$chosen" ]] && chosen=$iface
+    fi
+  done < <(ip -4 -o addr show scope global | awk '{ print $2, $4 }')
+  [[ -n "$chosen" ]] && echo "$chosen"
+}
+
+install_rfkill_wifi_unit() {
+  local rfkill_bin
+  rfkill_bin=$(command -v rfkill 2>/dev/null || true)
+  [[ -n "$rfkill_bin" ]] || return 0
+  cat > /etc/systemd/system/metacubexd-rfkill-wifi.service <<EOF
+[Unit]
+Description=Block Wi-Fi for the MetaCubeXD wired deployment
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=${rfkill_bin} block wifi
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl enable metacubexd-rfkill-wifi.service
+}
+
+configure_static_ip() {
+  local prefix mask ip_int network broadcast iface current_ip manager
+  local stamp backup conn
+
+  [[ "$LAN_CIDR" == */* ]] || die "--lan-cidr must be CIDR, e.g. 192.168.5.0/24"
+  prefix=${LAN_CIDR#*/}
+  if ! [[ "$prefix" =~ ^[0-9]+$ ]] ||
+    (( prefix < 8 || prefix > 30 )); then
+    die "unsupported prefix in --lan-cidr: $LAN_CIDR"
+  fi
+
+  ip_int=$(ipv4_to_int "$LAN_IP") ||
+    die "invalid --lan-ip: $LAN_IP"
+  mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+  network=$(( ip_int & mask ))
+  broadcast=$(( network | (~mask & 0xFFFFFFFF) ))
+  (( ip_int != network && ip_int != broadcast )) ||
+    die "$LAN_IP is the network or broadcast address of $LAN_CIDR"
+
+  if [[ -z "$NET_GATEWAY" ]]; then
+    NET_GATEWAY=$(ip -4 route show default | awk '{ print $3; exit }')
+  fi
+  [[ -n "$NET_GATEWAY" ]] || die "could not determine gateway; pass --gateway"
+  local gw_int
+  gw_int=$(ipv4_to_int "$NET_GATEWAY") || die "invalid gateway: $NET_GATEWAY"
+  (( (gw_int & mask) == network )) ||
+    die "gateway $NET_GATEWAY is not inside $LAN_CIDR"
+  NET_DNS=${NET_DNS:-$NET_GATEWAY}
+  ipv4_to_int "$NET_DNS" >/dev/null || die "invalid DNS server: $NET_DNS"
+
+  if [[ -n "$NET_IFACE" ]]; then
+    iface=$NET_IFACE
+  else
+    iface=$(find_iface_for_network "$network" "$mask")
+    if [[ -z "$iface" ]]; then
+      iface=$(ip -4 route show default | awk '{ print $5; exit }')
+    fi
+  fi
+  [[ -n "$iface" ]] || die "could not determine interface; pass --interface"
+
+  current_ip=$(ip -4 -o addr show dev "$iface" scope global 2>/dev/null |
+    awk '{ print $4; exit }')
+  if [[ "${current_ip%/*}" != "$LAN_IP" ]] &&
+    ping -c 1 -W 1 "$LAN_IP" >/dev/null 2>&1; then
+    die "$LAN_IP is already in use; choose another address"
+  fi
+  ping -c 1 -W 1 "$NET_GATEWAY" >/dev/null 2>&1 ||
+    die "gateway $NET_GATEWAY is not reachable from the current network"
+
+  echo "Writing static IP for $iface: $LAN_IP/$prefix via $NET_GATEWAY (DNS $NET_DNS)"
+  stamp=$(date +%Y%m%d-%H%M%S)
+
+  if command -v netplan >/dev/null 2>&1 &&
+    compgen -G "/etc/netplan/*.yaml" >/dev/null &&
+    systemctl is-active --quiet systemd-networkd; then
+    manager="netplan"
+    backup="/etc/netplan.bak.$stamp"
+    cp -a /etc/netplan "$backup"
+    cat > /etc/netplan/99-metacubexd.yaml <<EOF
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    ${iface}:
+      optional: true
+      dhcp4: false
+      dhcp6: false
+      addresses:
+        - ${LAN_IP}/${prefix}
+      routes:
+        - to: default
+          via: ${NET_GATEWAY}
+      nameservers:
+        addresses:
+          - ${NET_DNS}
+EOF
+    chmod 600 /etc/netplan/99-metacubexd.yaml
+    if [[ "$DISABLE_WIFI" == 1 ]]; then
+      # Netplan rejects a wifis stanza without access-points. Block the radio
+      # instead; the existing Wi-Fi profile may remain, but it cannot associate.
+      install_rfkill_wifi_unit
+    fi
+    if ! netplan generate; then
+      echo "netplan generate failed; restoring previous network config" >&2
+      rm -rf /etc/netplan
+      mv "$backup" /etc/netplan
+      netplan generate || true
+      die "netplan configuration was not applied"
+    fi
+    if [[ -d /etc/cloud ]]; then
+      mkdir -p /etc/cloud/cloud.cfg.d
+      cat > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg <<'EOF'
+network: {config: disabled}
+EOF
+    fi
+    systemctl enable systemd-networkd
+  elif command -v nmcli >/dev/null 2>&1 &&
+    systemctl is-active --quiet NetworkManager; then
+    manager="nm"
+    backup="/etc/NetworkManager/system-connections.bak.$stamp"
+    if [[ -d /etc/NetworkManager/system-connections ]]; then
+      cp -a /etc/NetworkManager/system-connections "$backup"
+    fi
+    conn=$(nmcli -t -f NAME,DEVICE connection show --active |
+      awk -F: -v d="$iface" '$2 == d { print $1; exit }')
+    if [[ -z "$conn" ]]; then
+      conn=$(nmcli -t -f NAME,DEVICE connection show |
+        awk -F: -v d="$iface" '$2 == d { print $1; exit }')
+    fi
+    [[ -n "$conn" ]] || die "no NetworkManager connection found for $iface"
+    nmcli connection modify "$conn" \
+      ipv4.method manual \
+      ipv4.addresses "${LAN_IP}/${prefix}" \
+      ipv4.gateway "$NET_GATEWAY" \
+      ipv4.dns "$NET_DNS"
+    if [[ "$DISABLE_WIFI" == 1 ]]; then
+      install_rfkill_wifi_unit
+    fi
+  elif command -v dhcpcd >/dev/null 2>&1 &&
+    systemctl is-active --quiet dhcpcd; then
+    manager="dhcpcd"
+    backup="/etc/dhcpcd.conf.bak.$stamp"
+    cp -a /etc/dhcpcd.conf "$backup"
+    sed -i '/^# MetaCubeXD managed begin$/,/^# MetaCubeXD managed end$/d' /etc/dhcpcd.conf
+    cat >> /etc/dhcpcd.conf <<EOF
+
+# MetaCubeXD managed begin
+interface ${iface}
+static ip_address=${LAN_IP}/${prefix}
+static routers=${NET_GATEWAY}
+static domain_name_servers=${NET_DNS}
+EOF
+    if [[ "$DISABLE_WIFI" == 1 ]]; then
+      cat >> /etc/dhcpcd.conf <<'EOF'
+denyinterfaces wlan0
+EOF
+      systemctl disable --now wpa_supplicant 2>/dev/null || true
+      install_rfkill_wifi_unit
+    fi
+    cat >> /etc/dhcpcd.conf <<'EOF'
+# MetaCubeXD managed end
+EOF
+  else
+    die "no supported network manager found (netplan/NetworkManager/dhcpcd)"
+  fi
+
+  echo "Static IP configuration written via $manager."
+  echo "Current IP is unchanged; reboot is required to apply ${LAN_IP}/${prefix}."
+  if [[ -n "${backup:-}" ]]; then
+    echo "Previous configuration backup: $backup"
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Start
@@ -502,7 +787,7 @@ if docker compose version >/dev/null 2>&1; then
 else
   # Fallback for systems without the Compose v2 plugin (some Raspberry Pi OS
   # images). The runtime flags mirror compose.yaml.
-  docker volume create metacubexd-data >/dev/null
+  docker volume create "$DATA_VOLUME" >/dev/null
   RUN_ARGS=(--name metacubexd --restart unless-stopped)
   if [[ "$IS_WSL" == true ]]; then
     RUN_ARGS+=(-p 8080:8080 -p 9090:9090 -p 7890:7890)
@@ -512,7 +797,7 @@ else
   docker run -d "${RUN_ARGS[@]}" \
     --env-file "$APP_DIR/.env" \
     -e CONTROL_PORT=8080 -e CLASH_API_PORT=9090 -e MIXED_PORT=7890 \
-    -v metacubexd-data:/data \
+    -v "${DATA_VOLUME}:/data" \
     "$IMAGE_TAG" >/dev/null
 fi
 
@@ -536,7 +821,17 @@ if [[ "$HEALTHY" != 1 ]]; then
   else
     docker logs --tail=100 metacubexd || true
   fi
+  if [[ -n "$PREVIOUS_IMAGE" ]]; then
+    echo "Rollback image is available: $PREVIOUS_IMAGE" >&2
+    echo "  docker rm -f metacubexd" >&2
+    echo "  docker tag $PREVIOUS_IMAGE $IMAGE_TAG" >&2
+    echo "  cd $APP_DIR && docker compose up -d --force-recreate" >&2
+  fi
   die "the container did not become healthy"
+fi
+
+if [[ "$SET_IP" == 1 ]]; then
+  configure_static_ip
 fi
 
 # ---------------------------------------------------------------------------
@@ -630,4 +925,14 @@ if [[ "$COMPOSE_MODE" == 1 ]]; then
   echo "Container logs: cd $APP_DIR && docker compose logs -f"
 else
   echo "Container logs: docker logs -f metacubexd"
+fi
+
+if [[ "$SET_IP" == 1 ]]; then
+  echo
+  echo "Static IP ${LAN_IP} is written but not active yet."
+  echo "Reboot to apply it: sudo reboot"
+  if [[ "$REBOOT_AFTER" == 1 ]]; then
+    echo "Rebooting now..."
+    reboot
+  fi
 fi

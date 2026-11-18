@@ -230,6 +230,14 @@ sudo bash install-mihomo-bypass-router.sh \
 sudo bash install-mihomo-bypass-router.sh \
   --lan-ip 192.168.5.100 --lan-cidr 192.168.5.0/24
 
+# 写入静态 IP（重启生效，同时禁用 Wi-Fi）
+sudo bash install-mihomo-bypass-router.sh \
+  --archive metacubexd-server-pi.tar.gz \
+  --tag metacubexd-server:pi \
+  --lan-ip 192.168.5.100 --lan-cidr 192.168.5.0/24 \
+  --set-ip --interface eth0 --gateway 192.168.5.1 --dns 192.168.5.1 \
+  --disable-wifi
+
 # 交叉构建（需要 buildx/QEMU）
 sudo bash install-mihomo-bypass-router.sh --platform linux/arm64
 ```
@@ -273,11 +281,40 @@ dist/metacubexd-pi-<metacubexd>-<mihomo>/
 
 ## 安装后配置
 
+### 0. 首次登录
+
+新镜像会在 `/config.js` 中自动注入：
+
+- `defaultBackendURL = http://<LAN_IP>:9090`
+- `defaultBackendSecret = CLASH_SECRET`
+- `controlToken = CONTROL_TOKEN`
+
+因此正常情况下打开：
+
+```text
+http://<LAN_IP>:8080
+```
+
+会自动连接后端，不需要手动填写。左侧应能看到 **Profiles / 配置文件**。
+
+如果仍然停在连接页，填写：
+
+```text
+后端地址：http://<LAN_IP>:9090
+密钥：sudo sed -n 's/^CLASH_SECRET=//p' /opt/metacubexd/.env
+```
+
+如果访问过旧版本，先清除浏览器站点数据或 Unregister Service Worker，再强制刷新。
+
 ### 1. 导入订阅
 
-打开 Dashboard，在 Profiles 中把订阅 URL 添加为 Remote Profile。
+进入 **Profiles / 配置文件**，点 **从 URL 导入 / Import from URL**，把机场的 **Clash / Mihomo** 订阅地址填进去。导入后点 **激活 / Activate**。
 
-### 2. 创建 Merge Profile
+### 2. 选择节点
+
+激活订阅后进入 **Proxies / 代理**，选择代理组和节点，点闪电图标测延迟。节点来自订阅，不需要逐个添加。
+
+### 3. 创建 Merge Profile
 
 安装脚本会生成：
 
@@ -285,7 +322,7 @@ dist/metacubexd-pi-<metacubexd>-<mihomo>/
 /opt/metacubexd/merge-profile.yaml
 ```
 
-把内容粘贴到 Dashboard 的 New Merge Profile 中并激活。模板包含：
+在 **Profiles → Merge overlays / 合并配置** 中新建，粘贴后启用。基础订阅必须先激活。模板包含：
 
 - `external-controller-cors`：允许 Dashboard 跨端口访问 Clash API
 - `allow-lan: false`：避免 7890 被 LAN 设备当成开放代理
@@ -357,6 +394,31 @@ git -C mihomo checkout v1.19.27   # 改成目标版本
 
 ```bash
 sudo bash install-mihomo-bypass-router.sh --rebuild
+```
+
+### 覆盖升级镜像
+
+保留已有 `.env` 和 `metacubexd-data` 卷，直接加载新镜像并重建容器：
+
+```bash
+sudo bash install-mihomo-bypass-router.sh \
+  --archive metacubexd-server-pi.tar.gz \
+  --tag metacubexd-server:pi \
+  --lan-ip 192.168.5.100 \
+  --lan-cidr 192.168.5.0/24
+```
+
+- 旧镜像会保存为 `metacubexd-server:pi.previous`
+- 不会删除 `/data` 卷
+- 不要在升级时执行 `docker compose down -v` 或 `docker volume rm`
+
+回滚：
+
+```bash
+sudo docker rm -f metacubexd
+sudo docker tag metacubexd-server:pi.previous metacubexd-server:pi
+cd /opt/metacubexd
+sudo docker compose up -d --force-recreate
 ```
 
 ## 排错

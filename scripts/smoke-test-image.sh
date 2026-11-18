@@ -80,6 +80,7 @@ run_args+=(
   -p "${API_PORT}:9090"
   -e "CONTROL_TOKEN=${TOKEN}"
   -e "CLASH_SECRET=${SECRET}"
+  -e "DEFAULT_BACKEND_URL=http://127.0.0.1:9090"
   -e CONTROL_PORT=8080
   -e CLASH_API_PORT=9090
   -e MIXED_PORT=7890
@@ -110,6 +111,14 @@ done
 
 curl -fsS --max-time 5 "${BASE_URL}/" >/dev/null ||
   fail "dashboard returned an error"
+
+config_js=$(curl -fsS --max-time 5 "${BASE_URL}/config.js" || true)
+printf '%s' "$config_js" | grep -q "\"controlToken\":\"${TOKEN}\"" ||
+  fail "config.js did not inject CONTROL_TOKEN"
+printf '%s' "$config_js" | grep -q "\"defaultBackendSecret\":\"${SECRET}\"" ||
+  fail "config.js did not inject CLASH_SECRET"
+printf '%s' "$config_js" | grep -q '"defaultBackendURL":"http://127.0.0.1:9090"' ||
+  fail "config.js did not inject DEFAULT_BACKEND_URL"
 
 kernel_status=""
 for _ in $(seq 1 60); do
