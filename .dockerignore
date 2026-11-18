@@ -1,0 +1,20 @@
+# Keep the local build context small and reproducible.
+**/.git
+**/.gitignore
+**/.github
+**/node_modules
+**/.output
+**/.nuxt
+**/.nitro
+**/.cache
+**/dist
+**/coverage
+**/.tmp-data
+**/.DS_Store
+**/*.log
+
+# Build/deployment helpers that are not needed inside the image.
+install-mihomo-bypass-router.sh
+readme.md
+scripts/
+docs/

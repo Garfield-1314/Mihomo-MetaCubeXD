@@ -1,0 +1,6 @@
+[submodule "mihomo"]
+	path = mihomo
+	url = https://github.com/MetaCubeX/mihomo.git
+[submodule "metacubexd"]
+	path = metacubexd
+	url = https://github.com/MetaCubeX/metacubexd.git

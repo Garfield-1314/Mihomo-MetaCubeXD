@@ -1,0 +1,71 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (for example v1.275.2-mihomo-v1.19.27)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release-pi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Preflight pinned sources
+        run: bash scripts/ci-preflight.sh
+
+      - name: Build Raspberry Pi bundle
+        env:
+          NUXT_FONTS_DISABLE_REMOTE: 'true'
+          BUILDX_CACHE_FROM: type=gha,scope=release-arm64
+          BUILDX_CACHE_TO: type=gha,mode=max,scope=release-arm64
+        run: bash scripts/package-pi-image.sh --tag metacubexd-server:pi
+
+      - name: Smoke test arm64 image
+        run: bash scripts/smoke-test-image.sh --platform linux/arm64 metacubexd-server:pi
+
+      - name: Verify bundle checksums
+        run: |
+          cd dist
+          for sum in *.sha256; do
+            sha256sum -c "$sum"
+          done
+          for dir in metacubexd-pi-*/; do
+            (cd "$dir" && sha256sum -c SHA256SUMS)
+          done
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: MetaCubeXD Pi ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256

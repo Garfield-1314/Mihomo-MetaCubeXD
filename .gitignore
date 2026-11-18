@@ -1,0 +1,11 @@
+.env
+.env.*
+*.tar
+*.tar.gz
+node_modules/
+.output/
+.nuxt/
+.nitro/
+dist/
+coverage/
+.DS_Store

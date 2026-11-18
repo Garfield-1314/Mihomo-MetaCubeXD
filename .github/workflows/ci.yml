@@ -1,0 +1,118 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Preflight pinned sources
+        run: bash scripts/ci-preflight.sh
+
+      - name: Shell syntax
+        run: |
+          bash -n install-mihomo-bypass-router.sh
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck install-mihomo-bypass-router.sh scripts/*.sh
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Actionlint
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint" -color
+
+  build-amd64:
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build local amd64 image
+        env:
+          TARGET_PLATFORM: linux/amd64
+          NUXT_FONTS_DISABLE_REMOTE: 'true'
+          BUILDX_CACHE_FROM: type=gha,scope=ci-amd64
+          BUILDX_CACHE_TO: type=gha,mode=max,scope=ci-amd64
+        run: bash scripts/build-local-image.sh --tag metacubexd-server:ci-amd64
+
+      - name: Smoke test amd64 image
+        run: bash scripts/smoke-test-image.sh metacubexd-server:ci-amd64
+
+  build-pi:
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build Raspberry Pi bundle
+        env:
+          NUXT_FONTS_DISABLE_REMOTE: 'true'
+          BUILDX_CACHE_FROM: type=gha,scope=ci-arm64
+          BUILDX_CACHE_TO: type=gha,mode=max,scope=ci-arm64
+        run: bash scripts/package-pi-image.sh --tag metacubexd-server:pi
+
+      - name: Smoke test arm64 image
+        run: bash scripts/smoke-test-image.sh --platform linux/arm64 metacubexd-server:pi
+
+      - name: Verify bundle checksums
+        run: |
+          cd dist
+          for sum in *.sha256; do
+            sha256sum -c "$sum"
+          done
+          for dir in metacubexd-pi-*/; do
+            (cd "$dir" && sha256sum -c SHA256SUMS)
+          done
+
+      - name: Upload Pi bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: metacubexd-pi-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14

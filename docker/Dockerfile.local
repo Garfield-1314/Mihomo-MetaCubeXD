@@ -1,0 +1,111 @@
+# Local-source build of the MetaCubeXD all-in-one server.
+#
+# Build context MUST be the repository root:
+#   docker build -f docker/Dockerfile.local -t metacubexd-server:local .
+#
+# The image is built from:
+#   - mihomo/        the local Go kernel source (pinned submodule)
+#   - metacubexd/    the local dashboard/server monorepo
+# No GHCR image and no GitHub release download are used.
+
+ARG NODE_VERSION=22
+ARG GO_VERSION=1.26
+# Override for a Docker Hub mirror, e.g. docker.m.daocloud.io.
+ARG BASE_REGISTRY=docker.io
+
+# ---- Stage 1: build the mihomo kernel from the local submodule ----
+# Build tools run on the builder platform; Go cross-compiles to TARGETARCH.
+FROM --platform=$BUILDPLATFORM ${BASE_REGISTRY}/library/golang:${GO_VERSION}-alpine AS kernel
+
+ARG TARGETARCH=amd64
+ARG MIHOMO_VERSION=v1.19.27
+ARG GOPROXY=https://proxy.golang.org,direct
+
+ENV GOPROXY=${GOPROXY}
+
+RUN apk add --no-cache ca-certificates git
+
+WORKDIR /src/mihomo
+COPY mihomo/ ./
+
+ENV CGO_ENABLED=0 \
+    GOTOOLCHAIN=local
+
+# with_gvisor is required for the TUN stacks used by the dashboard.
+# GOAMD64=v1 keeps the amd64 binary compatible with older/virtualised CPUs.
+RUN set -eux; \
+    export GOOS=linux GOARCH="${TARGETARCH}"; \
+    if [ "${TARGETARCH}" = "amd64" ]; then export GOAMD64=v1; fi; \
+    go build -tags with_gvisor -trimpath -buildvcs=false \
+      -ldflags "-X github.com/metacubex/mihomo/constant.Version=${MIHOMO_VERSION} -w -s -buildid=" \
+      -o /out/mihomo .
+
+# ---- Stage 2: build the dashboard UI and the Nitro control server ----
+# The UI/server build runs on the builder platform, not under QEMU.
+FROM --platform=$BUILDPLATFORM ${BASE_REGISTRY}/library/node:${NODE_VERSION}-alpine AS builder
+
+ARG NPM_REGISTRY=https://registry.npmjs.org/
+# Skip the remote Google Fonts metadata fetch for offline/local builds.
+ARG NUXT_FONTS_DISABLE_REMOTE=true
+
+ENV PNPM_HOME=/pnpm \
+    PATH=/pnpm:$PATH \
+    HUSKY=0 \
+    ELECTRON_SKIP_BINARY_DOWNLOAD=1 \
+    COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+    npm_config_registry=${NPM_REGISTRY} \
+    COREPACK_NPM_REGISTRY=${NPM_REGISTRY} \
+    NUXT_FONTS_DISABLE_REMOTE=${NUXT_FONTS_DISABLE_REMOTE}
+
+WORKDIR /repo
+
+RUN npm config set registry "$NPM_REGISTRY" && corepack enable
+
+COPY metacubexd/pnpm-workspace.yaml metacubexd/pnpm-lock.yaml metacubexd/package.json metacubexd/tsconfig.base.json ./
+COPY metacubexd/packages/ packages/
+COPY metacubexd/apps/ apps/
+COPY docker/patch-offline-fonts.mjs /tmp/patch-offline-fonts.mjs
+
+RUN if [ "$NUXT_FONTS_DISABLE_REMOTE" = "true" ]; then \
+      node /tmp/patch-offline-fonts.mjs; \
+    fi
+
+RUN pnpm install --frozen-lockfile
+RUN pnpm --filter @metacubexd/ui generate
+RUN pnpm --filter @metacubexd/server... build
+
+# ---- Stage 3: minimal runtime ----
+FROM ${BASE_REGISTRY}/library/node:${NODE_VERSION}-alpine AS runtime
+
+ARG METACUBEXD_VERSION=dev
+
+LABEL org.opencontainers.image.title="MetaCubeXD All-in-One Server (local source build)"
+LABEL org.opencontainers.image.version="${METACUBEXD_VERSION}"
+
+RUN apk add --no-cache ca-certificates tzdata tini wget
+
+WORKDIR /app
+
+COPY --from=builder /repo/apps/server/.output ./
+COPY --from=builder /repo/packages/ui/.output/public ./ui-dist
+COPY --from=kernel /out/mihomo /usr/local/bin/mihomo
+COPY metacubexd/apps/server/docker-entrypoint.sh /docker-entrypoint.sh
+
+RUN chmod +x /docker-entrypoint.sh /usr/local/bin/mihomo
+
+ENV NODE_ENV=production \
+    UI_DIST=/app/ui-dist \
+    MIHOMO_BIN=/usr/local/bin/mihomo \
+    DATA_DIR=/data \
+    CONTROL_PORT=8080 \
+    CLASH_API_PORT=9090 \
+    MIXED_PORT=7890
+
+VOLUME ["/data"]
+EXPOSE 8080 9090 7890
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -qO- "http://127.0.0.1:${CONTROL_PORT}/api/control/health" || exit 1
+
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["/docker-entrypoint.sh"]
