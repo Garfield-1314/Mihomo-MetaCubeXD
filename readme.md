@@ -5,12 +5,25 @@
 在 Debian/Ubuntu 上部署 MetaCubeXD 一体化服务（Dashboard + Control Agent + mihomo 内核），
 默认使用本仓库中的本地源码构建镜像，而不是拉取 GHCR 上的 `latest` 镜像。
 
+## 部署只需要一个订阅
+
+全新部署的验收标准只有一条：
+
+```text
+打开 http://<LAN_IP>:8080 → 粘贴一个订阅 URL → 完成
+```
+
+AIO 会自动创建受管路由器配置、开启 TUN、写入 DNS/规则/分组、校验并激活，不需要再手工
+创建 Merge Profile、打开 TUN 开关或执行 iptables。以后添加第二个订阅，仍然使用同一个
+导入框，节点会自动汇总。
+
 ## 组成
 
 ```
 .
 ├── mihomo/                         # mihomo Go 内核源码（子模块，固定到 v1.19.27）
 ├── metacubexd/                     # MetaCubeXD monorepo（UI / Agent / Server / Desktop）
+├── docker/router-mode.patch        # 旁路由/多订阅补丁，构建时自动应用到 metacubexd
 ├── docker/Dockerfile.local         # 本地源码构建的一体化镜像
 ├── scripts/build-local-image.sh    # 构建脚本
 ├── scripts/package-pi-image.sh     # 树莓派 arm64 交付包
@@ -134,7 +147,7 @@ sudo bash install-mihomo-bypass-router.sh
 2. 从 `mihomo/` 和 `metacubexd/` 构建 `metacubexd-server:local`。
 3. 启动容器。优先用 Compose；没有 Compose v2 时自动回退到 `docker run`。
 4. 等待 `/api/control/health` 通过。
-5. 生成 Dashboard Merge Profile 模板。
+5. 启用旁路由转发、健康检查、日志轮转和每日备份。
 
 默认地址：
 
@@ -184,8 +197,9 @@ WSL 模式只做 UI/订阅测试，不启用 TUN，地址为 `http://localhost:8
      --lan-ip 192.168.5.100 --lan-cidr 192.168.5.0/24
    ```
 
-4. 导入订阅、激活 `/opt/metacubexd/merge-profile.yaml`，然后把客户端的网关和
-   DNS 指向树莓派 LAN IP。
+4. 打开 Dashboard，只粘贴一个订阅 URL。AIO 会自动创建受管路由器配置、开启 TUN、
+   写入 DNS/规则/分组并激活，不需要再建 Merge Profile。
+5. 把客户端的网关和 DNS 指向树莓派 LAN IP，或由主路由 DHCP 统一下发。
 
 ### WSL（只测试）
 
@@ -197,6 +211,17 @@ sudo bash install-mihomo-bypass-router.sh
 - 打开 `http://localhost:8080`，导入订阅。
 - 使用生成的 `/opt/metacubexd/merge-profile.yaml` 配置 CORS。
 - 不要在 WSL 里设置客户端网关/DNS；TUN 相关步骤只适用于树莓派。
+
+### 本地开发/测试
+
+`metacubexd` 仍是上游子模块，旁路由改动保存在 `docker/router-mode.patch`。Docker 构建会自动
+应用；直接跑 TypeScript 测试前先执行：
+
+```bash
+bash scripts/apply-aio-patches.sh
+```
+
+该脚本只修改子模块工作区，不要提交子模块指针。
 
 ## 常用参数
 
@@ -306,61 +331,83 @@ http://<LAN_IP>:8080
 
 如果访问过旧版本，先清除浏览器站点数据或 Unregister Service Worker，再强制刷新。
 
-### 1. 导入订阅
+### 1. 只导入一个订阅
 
-进入 **Profiles / 配置文件**，点 **从 URL 导入 / Import from URL**，把机场的 **Clash / Mihomo** 订阅地址填进去。导入后点 **激活 / Activate**。
+进入 **配置文件 / Profiles**，在 **从 URL 导入** 里粘贴一个 Clash / Mihomo 订阅地址并导入。
 
-### 2. 选择节点
+就这样。路由器模式会自动完成：
 
-激活订阅后进入 **Proxies / 代理**，选择代理组和节点，点闪电图标测延迟。节点来自订阅，不需要逐个添加。
+- 创建受管的 **AIO Router** 基础配置
+- 为每个订阅生成一个 mihomo `proxy-provider`
+- 开启 TUN（`gvisor`、`Meta`、`auto-route`、`auto-redirect`）
+- 监听 `0.0.0.0:53` 并劫持 DNS（不受静态 IP 重启或 DHCP 变化影响）
+- 写入局域网直连、`GEOIP,CN,DIRECT` 和默认代理规则
+- 生成 `🚀 节点选择`、`♻️ 自动选择` 和每个订阅的 `📦` 分组
+- 校验配置并重启内核
+- 放行 `eth0 <-> Meta` 转发
 
-### 3. 创建 Merge Profile
+不需要再创建 Merge Profile，也不需要手动打开 TUN。
 
-安装脚本会生成：
+### 2. 添加更多订阅
 
-```text
-/opt/metacubexd/merge-profile.yaml
-```
+以后要加机场，继续用同一个导入框即可。每个订阅自动变成新的 provider：
 
-在 **Profiles → Merge overlays / 合并配置** 中新建，粘贴后启用。基础订阅必须先激活。模板包含：
+- 节点名带订阅前缀，避免重名
+- 不需要修改分组或规则
+- 某个订阅更新失败时，mihomo 保留上一次可用节点，其他订阅不受影响
+- 订阅节点由内核每 24 小时自动更新，不重启内核
 
-- `external-controller-cors`：允许 Dashboard 跨端口访问 Clash API
-- `allow-lan: false`：避免 7890 被 LAN 设备当成开放代理
-- TUN 配置：`stack: mips`、`auto-route`、`auto-redirect`、`dns-hijack`
-- `route-exclude-address`：排除 LAN、Docker、WSL 等网段
+不同订阅的节点会汇总到同一套路由器分组里。机场自带的 `proxy-groups` / `rules`
+不会带过来，这是聚合模式的取舍。
 
-如果 Dashboard 不是通过模板里的地址访问（例如反向代理域名），需要把该 origin 加进
-`external-controller-cors.allow-origins`。
+### 3. 客户端接入
 
-### 3. 旁路由
-
-把测试客户端的网关和 DNS 指向路由器的 LAN IP：
+把客户端的网关和 DNS 指向路由器的 LAN IP：
 
 ```text
 Gateway: <LAN_IP>
 DNS:     <LAN_IP>
 ```
 
-检查转发是否开启：
+或者在主路由 DHCP 里统一下发这两个值。树莓派默认不接管 DHCP，避免和主路由冲突。
+
+检查转发和 DNS：
 
 ```bash
 sysctl net.ipv4.ip_forward
-```
-
-检查 DNS：
-
-```bash
 dig @<LAN_IP> example.com
 ```
 
-如果 DNS 不工作，确认 mihomo 是否监听 53 端口。可以在 Merge Profile 中增加：
+检查 TUN 和策略路由：
 
-```yaml
-dns:
-  listen: 0.0.0.0:53
+```bash
+ip addr show Meta
+ip rule show
+ip route show table 2022
 ```
 
-需要确保宿主机 53 端口没有被 `systemd-resolved` 等程序占用，或者改用 dnsmasq 转发。
+正常情况下会看到 `Meta` 接口、`9000/9001/9002` 规则和 `table 2022` 的默认路由。
+
+### 4. 无人值守
+
+安装脚本会启用：
+
+```text
+metacubexd-forward.timer   每分钟补一次 TUN 转发规则
+metacubexd-health.timer    每分钟检查控制面和内核状态
+metacubexd-backup.timer    每天 03:30 备份 .env 和数据卷
+```
+
+Docker 日志限制为 `10 MB × 3`，不会长期写满 SD 卡。镜像升级仍然手动触发，
+不会自动升级。
+
+查看状态：
+
+```bash
+systemctl list-timers 'metacubexd-*'
+sudo journalctl -t metacubexd-health -n 50
+sudo ls -lh /opt/metacubexd/backups
+```
 
 ## 安全说明
 
@@ -371,8 +418,8 @@ Dashboard 没有登录页。`CONTROL_TOKEN` 会注入页面，任何能打开 80
 - 只允许可信 LAN 访问 8080/9090/7890
 - 不要直接暴露到公网
 - 远程访问请使用 WireGuard/Tailscale，或带认证的 TLS 反向代理
-- Merge Profile 默认 `allow-lan: false`；如果确实要让 LAN 设备使用 7890，请同时配置
-  `authentication` 和访问控制
+- 路由器模式默认 `allow-lan: false`；如果确实要让 LAN 设备使用 7890，请在
+  `AIO Router` 模板中同时配置 `authentication` 和访问控制
 
 ## 更新
 
@@ -425,8 +472,8 @@ sudo docker compose up -d --force-recreate
 
 ### UI 提示 Unable to connect to backend
 
-这是跨源问题。确认 Merge Profile 中的 `external-controller-cors.allow-origins` 包含 Dashboard
-的实际 origin，例如：
+这是跨源问题。路由器模式的受管配置会自动写入 Dashboard origin；如果通过反向代理域名
+访问，需要把该 origin 加进受管配置模板（或增加一个全局合并覆盖）：
 
 ```yaml
 external-controller-cors:
@@ -485,7 +532,8 @@ geox-url:
 - 内核支持 nftables
 - `net.ipv4.ip_forward=1`
 - 防火墙没有阻断 TUN 接口
-- Merge Profile 已激活
+- 配置文件页显示 `AIO Router` 为当前激活，而不是某个机场订阅
+- `systemctl status metacubexd-forward.timer` 正常
 
 ## CI
 

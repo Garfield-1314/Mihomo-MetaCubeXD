@@ -1,0 +1,2205 @@
+diff --git a/apps/server/lib/__tests__/supervisor.spec.ts b/apps/server/lib/__tests__/supervisor.spec.ts
+index d4de557e..3d32a6f0 100644
+--- a/apps/server/lib/__tests__/supervisor.spec.ts
++++ b/apps/server/lib/__tests__/supervisor.spec.ts
+@@ -41,6 +41,10 @@ describe('apps/server lib/supervisor', () => {
+     expect(env.dataDir).toBe('/data')
+     expect(env.mihomoBin).toBe('/usr/local/bin/mihomo')
+     expect(env.githubToken).toBe('')
++    expect(env.routerMode).toBe(false)
++    expect(env.lanIp).toBe('')
++    expect(env.lanCidr).toBe('')
++    expect(env.tunStack).toBe('gvisor')
+   })
+ 
+   it('honours overridden ports/paths from env', async () => {
+@@ -60,6 +64,19 @@ describe('apps/server lib/supervisor', () => {
+     expect(env.githubToken).toBe('github-token')
+   })
+ 
++  it('enables router mode only when ROUTER_MODE is truthy', async () => {
++    process.env.ROUTER_MODE = '1'
++    process.env.LAN_IP = '192.168.5.100'
++    process.env.LAN_CIDR = '192.168.5.0/24'
++    process.env.TUN_STACK = 'gvisor'
++    const { serverEnv } = await import('../supervisor')
++    const env = serverEnv()
++    expect(env.routerMode).toBe(true)
++    expect(env.lanIp).toBe('192.168.5.100')
++    expect(env.lanCidr).toBe('192.168.5.0/24')
++    expect(env.tunStack).toBe('gvisor')
++  })
++
+   it('builds the agent exactly once with env-derived options (singleton)', async () => {
+     process.env.DATA_DIR = '/data'
+     process.env.MIHOMO_BIN = '/usr/local/bin/mihomo'
+diff --git a/apps/server/lib/supervisor.ts b/apps/server/lib/supervisor.ts
+index 201c7a35..649f402b 100644
+--- a/apps/server/lib/supervisor.ts
++++ b/apps/server/lib/supervisor.ts
+@@ -12,6 +12,10 @@ export interface ServerEnv {
+   clashSecret: string
+   githubToken: string
+   defaultBackendURL: string
++  routerMode: boolean
++  lanIp: string
++  lanCidr: string
++  tunStack: string
+ }
+ 
+ function int(value: string | undefined, fallback: number): number {
+@@ -19,6 +23,10 @@ function int(value: string | undefined, fallback: number): number {
+   return Number.isFinite(n) ? n : fallback
+ }
+ 
++function bool(value: string | undefined): boolean {
++  return value === '1' || value?.toLowerCase() === 'true'
++}
++
+ /** Read process.env into a typed ServerEnv with documented defaults. */
+ export function serverEnv(): ServerEnv {
+   return {
+@@ -31,6 +39,10 @@ export function serverEnv(): ServerEnv {
+     clashSecret: process.env.CLASH_SECRET ?? '',
+     githubToken: process.env.GITHUB_TOKEN ?? '',
+     defaultBackendURL: process.env.DEFAULT_BACKEND_URL ?? '',
++    routerMode: bool(process.env.ROUTER_MODE),
++    lanIp: process.env.LAN_IP ?? '',
++    lanCidr: process.env.LAN_CIDR ?? '',
++    tunStack: process.env.TUN_STACK ?? 'gvisor',
+   }
+ }
+ 
+@@ -62,6 +74,14 @@ export function getAgent(): Agent {
+     // strips any profile mixed-port on spawn and, without a managed value, never
+     // re-adds one, so the published proxy port (7890) stays closed (#2067).
+     mixedPort: env.mixedPort,
++    router: env.routerMode
++      ? {
++          enabled: true,
++          lanIp: env.lanIp,
++          lanCidr: env.lanCidr,
++          tunStack: env.tunStack,
++        }
++      : undefined,
+   })
+   return agentSingleton
+ }
+diff --git a/apps/server/plugins/boot-kernel.ts b/apps/server/plugins/boot-kernel.ts
+index 8e4fbf7e..68b0325a 100644
+--- a/apps/server/plugins/boot-kernel.ts
++++ b/apps/server/plugins/boot-kernel.ts
+@@ -13,10 +13,22 @@ import { getAgent } from '../lib/supervisor'
+ // active config (external-controller/secret/mixed-port) and mihomo runs on its
+ // defaults — enough for the dashboard to connect; importing a profile restarts it.
+ export default defineNitroPlugin(() => {
+-  const { supervisor, scheduler } = getAgent()
++  const { supervisor, scheduler, routerController } = getAgent()
++
++  // Router mode rebuilds the managed base/provider caches before the kernel
++  // starts. Keep this off the server-startup path: if the network or a source
++  // is slow, the dashboard must still come up immediately. On failure the
++  // previous active config is used, preserving the last known-good routing.
++  const prepared = routerController
++    ? routerController
++        .bootstrap()
++        .then(() => console.log('[router] managed base is ready'))
++        .catch((err) => console.error('[router] bootstrap failed:', err))
++    : Promise.resolve()
++
+   console.log('[kernel] starting bundled mihomo on boot…')
+-  supervisor
+-    .start()
++  void prepared
++    .then(() => supervisor.start())
+     .then((s) =>
+       console.log(`[kernel] ${s.status}${s.pid ? ` (pid ${s.pid})` : ''}`),
+     )
+diff --git a/packages/agent/src/http.test.ts b/packages/agent/src/http.test.ts
+index c2cafc67..b346a689 100644
+--- a/packages/agent/src/http.test.ts
++++ b/packages/agent/src/http.test.ts
+@@ -1,4 +1,5 @@
+ import type { AddressInfo } from 'node:net'
++import type { RouterController } from './router'
+ import type { KernelState, ProfileMeta } from './types'
+ import { Buffer } from 'node:buffer'
+ import { mkdtempSync, readdirSync } from 'node:fs'
+@@ -106,7 +107,34 @@ function makeDeps(token?: string) {
+   }))
+   const homeDir = mkdtempSync(join(tmpdir(), 'mcxd-http-'))
+   const activeConfigPath = join(homeDir, 'active.yaml')
+-  return { supervisor, profiles, info, homeDir, activeConfigPath, token }
++  return {
++    supervisor,
++    profiles,
++    info,
++    homeDir,
++    activeConfigPath,
++    token,
++    router: undefined as RouterController | undefined,
++  }
++}
++
++function fakeRouter(): RouterController & {
++  onSourceImported: ReturnType<typeof vi.fn>
++  onSourcesChanged: ReturnType<typeof vi.fn>
++  onSourceRefreshed: ReturnType<typeof vi.fn>
++} {
++  return {
++    enabled: true,
++    bootstrap: vi.fn(async () => {}),
++    isManaged: (meta: ProfileMeta) => meta.managedBy === 'router',
++    isSource: (meta: ProfileMeta) =>
++      meta.type !== 'merge' &&
++      meta.type !== 'script' &&
++      meta.managedBy !== 'router',
++    onSourceImported: vi.fn(async () => {}),
++    onSourcesChanged: vi.fn(async () => fakeState({ status: 'running' })),
++    onSourceRefreshed: vi.fn(async () => {}),
++  }
+ }
+ 
+ async function mount(deps: ReturnType<typeof makeDeps>) {
+@@ -334,6 +362,78 @@ describe('createControlRouter — profiles + SSE', () => {
+     )
+   })
+ 
++  it('pOST /api/control/profiles/import registers a router source', async () => {
++    const deps = makeDeps()
++    const router = fakeRouter()
++    deps.router = router
++    srv = await mount(deps)
++    const res = await fetch(`${srv.base}/api/control/profiles/import`, {
++      method: 'POST',
++      headers: { 'content-type': 'application/json' },
++      body: JSON.stringify({ url: 'https://sub', name: 'sub' }),
++    })
++    expect(res.status).toBe(200)
++    expect(router.onSourceImported).toHaveBeenCalledWith('p4')
++  })
++
++  it('pOST /api/control/profiles/import rolls back a failed router source', async () => {
++    const deps = makeDeps()
++    const router = fakeRouter()
++    router.onSourceImported.mockRejectedValue(new Error('invalid source'))
++    deps.router = router
++    srv = await mount(deps)
++    const res = await fetch(`${srv.base}/api/control/profiles/import`, {
++      method: 'POST',
++      headers: { 'content-type': 'application/json' },
++      body: JSON.stringify({ url: 'https://sub' }),
++    })
++    expect(res.status).toBe(400)
++    expect(deps.profiles.delete).toHaveBeenCalledWith('p4')
++  })
++
++  it('pOST /profiles/:id/activate treats a router source as enable-source', async () => {
++    const deps = makeDeps()
++    const router = fakeRouter()
++    deps.router = router
++    const sources: ProfileMeta[] = [
++      { id: 'p4', name: 'sub', type: 'remote', updatedAt: 5 },
++    ]
++    deps.profiles.list.mockResolvedValue(sources)
++    srv = await mount(deps)
++    const res = await fetch(`${srv.base}/api/control/profiles/p4/activate`, {
++      method: 'POST',
++    })
++    expect(res.status).toBe(200)
++    expect(router.onSourcesChanged).toHaveBeenCalledOnce()
++    expect(deps.profiles.setActive).not.toHaveBeenCalled()
++  })
++
++  it('refuses to edit or delete the managed router base', async () => {
++    const deps = makeDeps()
++    deps.router = fakeRouter()
++    const profiles: ProfileMeta[] = [
++      {
++        id: 'base',
++        name: 'AIO Router',
++        type: 'local',
++        managedBy: 'router',
++        updatedAt: 1,
++      },
++    ]
++    deps.profiles.list.mockResolvedValue(profiles)
++    srv = await mount(deps)
++    const put = await fetch(`${srv.base}/api/control/profiles/base`, {
++      method: 'PUT',
++      headers: { 'content-type': 'application/json' },
++      body: JSON.stringify({ name: 'hijack' }),
++    })
++    expect(put.status).toBe(403)
++    const del = await fetch(`${srv.base}/api/control/profiles/base`, {
++      method: 'DELETE',
++    })
++    expect(del.status).toBe(403)
++  })
++
+   it('pOST /api/control/profiles/import preserves an upstream 429 response (#2138)', async () => {
+     const deps = makeDeps()
+     deps.profiles.importFromUrl.mockRejectedValue(
+diff --git a/packages/agent/src/http.ts b/packages/agent/src/http.ts
+index 9a83313b..0c98ca4d 100644
+--- a/packages/agent/src/http.ts
++++ b/packages/agent/src/http.ts
+@@ -1,6 +1,7 @@
+ import type { ConfigPatchV1 } from '@metacubexd/config-editor'
+ import type { App, H3Event } from 'h3'
+ import type { ProfileConfigEditor } from './profile-editor'
++import type { RouterController } from './router'
+ import type {
+   KernelLogLine,
+   KernelManager,
+@@ -37,6 +38,7 @@ import {
+   ProfileEditorValidationError,
+ } from './profile-editor'
+ import { SubscriptionFetchError } from './profiles'
++import { parseRouterSource } from './router'
+ import { TunPreconditionError } from './tun'
+ import { createWebdavClient as defaultCreateWebdavClient } from './webdav'
+ 
+@@ -78,6 +80,7 @@ export interface ControlRouterDeps {
+   systemProxy?: SystemProxyController // OS proxy controller; capability-gated
+   kernelManager?: KernelManager // kernel version mgmt; capability-gated
+   tunController?: TunController // TUN mode controller; capability-gated
++  router?: RouterController // AIO router mode; capability-gated 'router-mode'
+   geoFetch?: typeof fetch // override for tests; defaults to global fetch
+   createWebdavClient?: typeof defaultCreateWebdavClient // override for tests
+   readFile?: typeof defaultReadFile // override for tests; defaults to fs/promises readFile
+@@ -99,6 +102,7 @@ export function createControlRouter(deps: ControlRouterDeps): App {
+     systemProxy,
+     kernelManager,
+     tunController,
++    router: routerController,
+     geoFetch,
+     createWebdavClient = defaultCreateWebdavClient,
+     readFile = defaultReadFile,
+@@ -268,7 +272,28 @@ export function createControlRouter(deps: ControlRouterDeps): App {
+         content?: string
+         type?: 'local' | 'merge' | 'script'
+       }
+-      return profiles.create(body)
++      const meta = await profiles.create(body)
++      // Router mode: a local subscription/file import is another source. Blank
++      // advanced profiles are skipped so creating one never mutates router mode.
++      if (
++        routerController?.enabled &&
++        body.type !== 'merge' &&
++        body.type !== 'script' &&
++        body.content?.trim()
++      ) {
++        try {
++          await routerController.onSourceImported(meta.id)
++        } catch (error) {
++          throw createError({
++            statusCode: 400,
++            statusMessage: 'router source setup failed',
++            data: {
++              error: error instanceof Error ? error.message : String(error),
++            },
++          })
++        }
++      }
++      return meta
+     }),
+   )
+   router.get(
+@@ -300,14 +325,79 @@ export function createControlRouter(deps: ControlRouterDeps): App {
+           statusMessage: 'managed visual editor overlays are read-only',
+         })
+       }
+-      return profiles.update(id, body)
++      if (meta && routerController?.isManaged(meta)) {
++        throw createError({
++          statusCode: 403,
++          statusMessage: 'router base profile is managed',
++        })
++      }
++      if (
++        meta &&
++        routerController?.enabled &&
++        routerController.isSource(meta) &&
++        body.content !== undefined &&
++        !parseRouterSource(body.content)
++      ) {
++        throw createError({
++          statusCode: 400,
++          statusMessage: 'router source must be Clash YAML with proxies',
++        })
++      }
++      const updated = await profiles.update(id, body)
++      const sourceTouched =
++        body.name !== undefined ||
++        body.content !== undefined ||
++        body.enabled !== undefined
++      if (
++        meta &&
++        routerController?.enabled &&
++        routerController.isSource(meta) &&
++        sourceTouched
++      ) {
++        try {
++          await routerController.onSourcesChanged()
++        } catch (error) {
++          throw createError({
++            statusCode: 400,
++            statusMessage: 'router source update failed',
++            data: {
++              error: error instanceof Error ? error.message : String(error),
++            },
++          })
++        }
++      }
++      return updated
+     }),
+   )
+   router.delete(
+     `${PREFIX}/profiles/:id`,
+     defineEventHandler(async (event) => {
+       const id = getRouterParam(event, 'id')!
++      const meta = (await profiles.list()).find((item) => item.id === id)
++      if (meta && routerController?.isManaged(meta)) {
++        throw createError({
++          statusCode: 403,
++          statusMessage: 'router base profile is managed',
++        })
++      }
+       await profiles.delete(id)
++      if (
++        meta &&
++        routerController?.enabled &&
++        routerController.isSource(meta)
++      ) {
++        try {
++          await routerController.onSourcesChanged()
++        } catch (error) {
++          throw createError({
++            statusCode: 400,
++            statusMessage: 'router source removal failed',
++            data: {
++              error: error instanceof Error ? error.message : String(error),
++            },
++          })
++        }
++      }
+       return sendNoContent(event)
+     }),
+   )
+@@ -315,6 +405,13 @@ export function createControlRouter(deps: ControlRouterDeps): App {
+     `${PREFIX}/profiles/:id/duplicate`,
+     defineEventHandler(async (event) => {
+       const id = getRouterParam(event, 'id')!
++      const meta = (await profiles.list()).find((item) => item.id === id)
++      if (meta && routerController?.isManaged(meta)) {
++        throw createError({
++          statusCode: 403,
++          statusMessage: 'router base profile is managed',
++        })
++      }
+       const body = (await readBody(event).catch(() => ({}))) as {
+         name?: string
+       }
+@@ -325,9 +422,26 @@ export function createControlRouter(deps: ControlRouterDeps): App {
+     `${PREFIX}/profiles/import`,
+     defineEventHandler(async (event) => {
+       const body = (await readBody(event)) as { url: string; name?: string }
+-      return withSubscriptionHttpError(() =>
++      const meta = await withSubscriptionHttpError(() =>
+         profiles.importFromUrl(body.url, body.name),
+       )
++      if (routerController?.enabled) {
++        try {
++          await routerController.onSourceImported(meta.id)
++        } catch (error) {
++          // Keep the operation atomic: a source that cannot produce a valid
++          // router config must not leave a half-registered profile behind.
++          await profiles.delete(meta.id).catch(() => {})
++          throw createError({
++            statusCode: 400,
++            statusMessage: 'router source import failed',
++            data: {
++              error: error instanceof Error ? error.message : String(error),
++            },
++          })
++        }
++      }
++      return meta
+     }),
+   )
+   router.post(
+@@ -337,7 +451,21 @@ export function createControlRouter(deps: ControlRouterDeps): App {
+       // Pure refresh: re-fetch the remote subscription in place and return the
+       // updated meta. This does NOT touch the running config — pair it with
+       // activate, or use /refresh-and-activate for a combined apply (#2108).
+-      return withSubscriptionHttpError(() => profiles.refresh(id))
++      const meta = await withSubscriptionHttpError(() => profiles.refresh(id))
++      if (routerController?.enabled && routerController.isSource(meta)) {
++        try {
++          await routerController.onSourceRefreshed(id)
++        } catch (error) {
++          throw createError({
++            statusCode: 400,
++            statusMessage: 'router source refresh failed',
++            data: {
++              error: error instanceof Error ? error.message : String(error),
++            },
++          })
++        }
++      }
++      return meta
+     }),
+   )
+   // Combined refresh + apply: re-fetch the subscription, compose it into
+@@ -350,6 +478,10 @@ export function createControlRouter(deps: ControlRouterDeps): App {
+     defineEventHandler(async (event) => {
+       const id = getRouterParam(event, 'id')!
+       const meta = await withSubscriptionHttpError(() => profiles.refresh(id))
++      if (routerController?.enabled && routerController.isSource(meta)) {
++        await routerController.onSourceRefreshed(id)
++        return { meta, kernel: supervisor.getState() }
++      }
+       const kernel = await safeActivate(id)
+       return { meta, kernel }
+     }),
+@@ -358,6 +490,22 @@ export function createControlRouter(deps: ControlRouterDeps): App {
+     `${PREFIX}/profiles/:id/activate`,
+     defineEventHandler(async (event) => {
+       const id = getRouterParam(event, 'id')!
++      const meta = (await profiles.list()).find((item) => item.id === id)
++      // Router mode never activates a subscription directly: doing so would
++      // detach the running kernel from the managed base and drop the other
++      // sources. Treat activation as "enable this source" instead.
++      if (
++        meta &&
++        routerController?.enabled &&
++        routerController.isSource(meta)
++      ) {
++        if (meta.enabled === false) {
++          await profiles.update(id, { enabled: true })
++        }
++        return (
++          (await routerController.onSourcesChanged()) ?? supervisor.getState()
++        )
++      }
+       return safeActivate(id)
+     }),
+   )
+diff --git a/packages/agent/src/index.ts b/packages/agent/src/index.ts
+index 6d05867e..0b47b81c 100644
+--- a/packages/agent/src/index.ts
++++ b/packages/agent/src/index.ts
+@@ -1,3 +1,4 @@
++import type { RouterModeOptions } from './router'
+ import type { ScriptRunner } from './script'
+ import type { CreateSupervisorOptions } from './supervisor'
+ import type {
+@@ -10,6 +11,7 @@ import { MIHOMO_VERSION } from './kernel/assets'
+ import { createProfileConfigEditor } from './profile-editor'
+ import { createProfileStore } from './profiles'
+ import { applyActiveRefresh } from './refresh-apply'
++import { createRouterController } from './router'
+ import { createProfileScheduler } from './scheduler'
+ import { createScriptRunner } from './script'
+ import { createSupervisor } from './supervisor'
+@@ -37,6 +39,23 @@ export type {
+ export { createProfileStore } from './profiles'
+ export { applyActiveRefresh } from './refresh-apply'
+ export type { ApplyActiveRefreshOptions } from './refresh-apply'
++export {
++  createRouterController,
++  normalizeRouterTunStack,
++  parseRouterSource,
++  renderRouterConfig,
++  ROUTER_AUTO_GROUP,
++  ROUTER_BASE_NAME,
++  ROUTER_MAIN_GROUP,
++  ROUTER_TEST_URL,
++} from './router'
++export type {
++  CreateRouterControllerOptions,
++  RouterController,
++  RouterModeOptions,
++  RouterRenderOptions,
++  RouterSourceSpec,
++} from './router'
+ export { createProfileScheduler } from './scheduler'
+ export type {
+   ProfileRefreshResult,
+@@ -65,6 +84,9 @@ export type CreateAgentOptions = CreateSupervisorOptions & {
+   systemProxy?: SystemProxyController // OS proxy controller; enables 'system-proxy'
+   kernelManager?: KernelManager // kernel version mgmt; enables 'kernel-version'
+   tunController?: TunController // TUN mode controller; enables 'tun'
++  // AIO bypass-router mode: manages one base config and one proxy-provider per
++  // imported subscription. Off for desktop/plain server installs.
++  router?: RouterModeOptions
+ }
+ 
+ export interface AgentInfo {
+@@ -85,6 +107,15 @@ export function createAgent(opts: CreateAgentOptions) {
+     scriptRunner: opts.scriptRunner ?? createScriptRunner(),
+   })
+   const supervisor = createSupervisor(opts)
++  const routerController =
++    opts.router?.enabled === true
++      ? createRouterController({
++          ...opts.router,
++          profiles,
++          supervisor,
++          homeDir: opts.homeDir,
++        })
++      : undefined
+   const profileEditor = createProfileConfigEditor({
+     profiles,
+     supervisor,
+@@ -120,6 +151,7 @@ export function createAgent(opts: CreateAgentOptions) {
+       ...(systemProxy ? ['system-proxy'] : []),
+       ...(kernelManager ? ['kernel-version'] : []),
+       ...(tunController ? ['tun'] : []),
++      ...(routerController ? ['router-mode'] : []),
+     ],
+   })
+   const router = createControlRouter({
+@@ -133,6 +165,7 @@ export function createAgent(opts: CreateAgentOptions) {
+     systemProxy,
+     kernelManager,
+     tunController,
++    router: routerController,
+   })
+   // Wire the auto-update scheduler to the same profiles store. NOT started here
+   // — the server boot plugin starts it (the desktop builds its own scheduler so
+@@ -155,5 +188,6 @@ export function createAgent(opts: CreateAgentOptions) {
+     systemProxy,
+     kernelManager,
+     tunController,
++    routerController,
+   }
+ }
+diff --git a/packages/agent/src/router.test.ts b/packages/agent/src/router.test.ts
+new file mode 100644
+index 00000000..0862baae
+--- /dev/null
++++ b/packages/agent/src/router.test.ts
+@@ -0,0 +1,455 @@
++import type { KernelState, MihomoSupervisor } from './types'
++import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { parse } from 'yaml'
++import { createProfileStore } from './profiles'
++import {
++  createRouterController,
++  normalizeRouterTunStack,
++  parseRouterSource,
++  renderRouterConfig,
++  ROUTER_AUTO_GROUP,
++  ROUTER_MAIN_GROUP,
++} from './router'
++
++const SUB_A = `
++proxies:
++  - name: A-HK
++    type: ss
++    server: a.example.com
++    port: 8388
++    cipher: aes-128-gcm
++    password: secret
++  - name: A-US
++    type: ss
++    server: a2.example.com
++    port: 8388
++    cipher: aes-128-gcm
++    password: secret
++`
++
++const SUB_B = `
++proxies:
++  - name: B-JP
++    type: ss
++    server: b.example.com
++    port: 8388
++    cipher: aes-128-gcm
++    password: secret
++`
++
++const tempDirs: string[] = []
++
++async function tempHome(): Promise<string> {
++  const dir = await mkdtemp(join(tmpdir(), 'mcxd-router-'))
++  tempDirs.push(dir)
++  return dir
++}
++
++afterEach(async () => {
++  await Promise.all(
++    tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
++  )
++})
++
++function fakeSupervisor(valid = true): {
++  supervisor: MihomoSupervisor
++  validate: ReturnType<typeof vi.fn>
++  restart: ReturnType<typeof vi.fn>
++  start: ReturnType<typeof vi.fn>
++} {
++  const state: KernelState = {
++    status: 'running',
++    externalController: '127.0.0.1:9090',
++    secret: 'test-secret',
++    startedAt: 1,
++  }
++  const validate = vi.fn(async () => ({
++    valid,
++    message: valid ? '' : 'bad config',
++  }))
++  const restart = vi.fn(async () => state)
++  const start = vi.fn(async () => state)
++  const supervisor = {
++    getState: () => state,
++    start,
++    stop: async () => state,
++    restart,
++    setBinaryPath: () => {},
++    validate,
++    on: () => {},
++    off: () => {},
++    dispose: async () => {},
++  } as unknown as MihomoSupervisor
++  return { supervisor, validate, restart, start }
++}
++
++async function storeFor(home: string, fetchImpl?: typeof fetch) {
++  return createProfileStore({
++    dir: join(home, 'profiles'),
++    activeConfigPath: join(home, 'active.yaml'),
++    fetch: fetchImpl,
++  })
++}
++
++function subscriptionFetch(body: string): typeof fetch {
++  return (async () =>
++    new Response(body, {
++      status: 200,
++      headers: { 'content-type': 'application/yaml' },
++    })) as typeof fetch
++}
++
++describe('renderRouterConfig', () => {
++  it('stays valid and direct before the first subscription', () => {
++    const config = parse(renderRouterConfig([])) as Record<string, any>
++    expect(config['proxy-providers']).toBeUndefined()
++    expect(config['proxy-groups']).toEqual([
++      { name: ROUTER_MAIN_GROUP, type: 'select', proxies: ['DIRECT'] },
++    ])
++    expect(config.rules.at(-1)).toBe(`MATCH,${ROUTER_MAIN_GROUP}`)
++    expect(config.dns.listen).toBe('0.0.0.0:53')
++  })
++
++  it('turns two subscriptions into prefixed providers and source groups', () => {
++    const config = parse(
++      renderRouterConfig(
++        [
++          {
++            id: 'a',
++            name: 'Alpha',
++            providerName: 'router_a',
++            groupName: '📦 Alpha',
++            type: 'remote',
++            url: 'https://example.com/a',
++          },
++          {
++            id: 'b',
++            name: 'Beta',
++            providerName: 'router_b',
++            groupName: '📦 Beta',
++            type: 'local',
++          },
++        ],
++        {
++          lanIp: '192.168.5.100',
++          lanCidr: '192.168.5.0/24',
++          tunStack: 'gvisor',
++        },
++      ),
++    ) as Record<string, any>
++
++    expect(config.dns.listen).toBe('0.0.0.0:53')
++    expect(config.tun.stack).toBe('gvisor')
++    expect(config.tun.device).toBe('Meta')
++    expect(config['proxy-providers'].router_a).toMatchObject({
++      type: 'http',
++      url: 'https://example.com/a',
++      path: './providers/router_a.yaml',
++      interval: 86_400,
++      override: { 'additional-prefix': '[Alpha] ' },
++    })
++    expect(config['proxy-providers'].router_a.header).toEqual({
++      'User-Agent': ['clash.meta'],
++    })
++    expect(config['proxy-providers'].router_b).toMatchObject({
++      type: 'file',
++      path: './providers/router_b.yaml',
++      override: { 'additional-prefix': '[Beta] ' },
++    })
++    expect(config['proxy-providers'].router_b.url).toBeUndefined()
++
++    const groups = config['proxy-groups'] as Array<Record<string, any>>
++    expect(groups[0]).toMatchObject({
++      name: ROUTER_MAIN_GROUP,
++      'include-all-providers': true,
++    })
++    expect(groups[0]?.proxies).toEqual([
++      ROUTER_AUTO_GROUP,
++      '📦 Alpha',
++      '📦 Beta',
++      'DIRECT',
++    ])
++    expect(groups[1]).toMatchObject({
++      name: ROUTER_AUTO_GROUP,
++      type: 'url-test',
++      'include-all-providers': true,
++    })
++    expect(groups[2]).toMatchObject({ name: '📦 Alpha', use: ['router_a'] })
++    expect(groups[3]).toMatchObject({ name: '📦 Beta', use: ['router_b'] })
++    expect(config.rules).toContain('IP-CIDR,192.168.5.0/24,DIRECT,no-resolve')
++    expect(config.rules).toContain('GEOIP,CN,DIRECT')
++  })
++
++  it('never emits the unsupported mips stack', () => {
++    expect(normalizeRouterTunStack('mips')).toBe('gvisor')
++    expect(normalizeRouterTunStack('SYSTEM')).toBe('system')
++    const config = parse(
++      renderRouterConfig([], { tunStack: 'mips' }),
++    ) as Record<string, any>
++    expect(config.tun.stack).toBe('gvisor')
++  })
++})
++
++describe('parseRouterSource', () => {
++  it('accepts a Clash proxies list', () => {
++    expect(parseRouterSource(SUB_A)).toHaveLength(2)
++  })
++
++  it('rejects empty and non-Clash content', () => {
++    expect(parseRouterSource('proxies: []')).toBeUndefined()
++    expect(parseRouterSource('rules:\n  - MATCH,DIRECT')).toBeUndefined()
++    expect(parseRouterSource('not yaml: [')).toBeUndefined()
++  })
++})
++
++describe('router controller', () => {
++  it('creates the managed base and imports one provider', async () => {
++    const home = await tempHome()
++    const profiles = await storeFor(home, subscriptionFetch(SUB_A))
++    const { supervisor, validate, restart } = fakeSupervisor()
++    const controller = createRouterController({
++      enabled: true,
++      lanIp: '192.168.5.100',
++      lanCidr: '192.168.5.0/24',
++      tunStack: 'gvisor',
++      profiles,
++      supervisor,
++      homeDir: home,
++    })
++
++    const meta = await profiles.importFromUrl('https://example.com/a', 'Alpha')
++    await controller.onSourceImported(meta.id)
++
++    const list = await profiles.list()
++    const base = list.find((item) => item.managedBy === 'router')
++    expect(base?.name).toBe('AIO Router')
++    expect(await profiles.getActiveId()).toBe(base?.id)
++    expect(validate).toHaveBeenCalledOnce()
++    expect(restart).toHaveBeenCalledOnce()
++
++    const active = parse(
++      await readFile(join(home, 'active.yaml'), 'utf8'),
++    ) as Record<string, any>
++    expect(Object.keys(active['proxy-providers'])).toHaveLength(1)
++    const provider = Object.values(active['proxy-providers'])[0] as Record<
++      string,
++      any
++    >
++    expect(provider.override['additional-prefix']).toBe('[Alpha] ')
++    expect(await readdir(join(home, 'providers'))).toHaveLength(1)
++    const providerFile = await readFile(
++      join(
++        home,
++        'providers',
++        `${Object.keys(active['proxy-providers'])[0]}.yaml`,
++      ),
++      'utf8',
++    )
++    expect((parse(providerFile) as Record<string, any>).proxies).toHaveLength(2)
++  })
++
++  it('adds a second subscription without touching groups or rules by hand', async () => {
++    const home = await tempHome()
++    let payload = SUB_A
++    const fetchImpl = (async () =>
++      new Response(payload, { status: 200 })) as typeof fetch
++    const profiles = await storeFor(home, fetchImpl)
++    const { supervisor } = fakeSupervisor()
++    const controller = createRouterController({
++      enabled: true,
++      lanIp: '192.168.5.100',
++      lanCidr: '192.168.5.0/24',
++      profiles,
++      supervisor,
++      homeDir: home,
++    })
++
++    const alpha = await profiles.importFromUrl('https://example.com/a', 'Alpha')
++    await controller.onSourceImported(alpha.id)
++    payload = SUB_B
++    const beta = await profiles.importFromUrl('https://example.com/b', 'Beta')
++    await controller.onSourceImported(beta.id)
++
++    const active = parse(
++      await readFile(join(home, 'active.yaml'), 'utf8'),
++    ) as Record<string, any>
++    expect(Object.keys(active['proxy-providers'])).toHaveLength(2)
++    const groups = active['proxy-groups'] as Array<Record<string, any>>
++    expect(groups.map((group) => group.name)).toEqual([
++      ROUTER_MAIN_GROUP,
++      ROUTER_AUTO_GROUP,
++      '📦 Alpha',
++      '📦 Beta',
++    ])
++    expect(await readdir(join(home, 'providers'))).toHaveLength(2)
++  })
++
++  it('removes a disabled source and falls back to direct when the last one goes', async () => {
++    const home = await tempHome()
++    const profiles = await storeFor(home, subscriptionFetch(SUB_A))
++    const { supervisor } = fakeSupervisor()
++    const controller = createRouterController({
++      enabled: true,
++      profiles,
++      supervisor,
++      homeDir: home,
++    })
++
++    const meta = await profiles.importFromUrl('https://example.com/a', 'Alpha')
++    await controller.onSourceImported(meta.id)
++    await profiles.update(meta.id, { enabled: false })
++    await controller.onSourcesChanged()
++
++    const active = parse(
++      await readFile(join(home, 'active.yaml'), 'utf8'),
++    ) as Record<string, any>
++    expect(active['proxy-providers']).toBeUndefined()
++    expect(active['proxy-groups']).toEqual([
++      { name: ROUTER_MAIN_GROUP, type: 'select', proxies: ['DIRECT'] },
++    ])
++    expect(await readdir(join(home, 'providers'))).toEqual([])
++  })
++
++  it('deletes the managed base when a new import fails validation', async () => {
++    const home = await tempHome()
++    const profiles = await storeFor(home, subscriptionFetch(SUB_A))
++    const { supervisor } = fakeSupervisor(false)
++    const controller = createRouterController({
++      enabled: true,
++      profiles,
++      supervisor,
++      homeDir: home,
++    })
++
++    const meta = await profiles.importFromUrl('https://example.com/a', 'Alpha')
++    await expect(controller.onSourceImported(meta.id)).rejects.toThrow(
++      'config validation failed',
++    )
++    expect(
++      (await profiles.list()).filter((item) => item.managedBy === 'router'),
++    ).toHaveLength(0)
++    await expect(profiles.getActiveId()).resolves.toBeUndefined()
++  })
++
++  it('keeps the previous base when an update fails validation', async () => {
++    const home = await tempHome()
++    const profiles = await storeFor(home, subscriptionFetch(SUB_A))
++    let valid = true
++    const { supervisor, validate } = fakeSupervisor(true)
++    validate.mockImplementation(async () => ({
++      valid,
++      message: valid ? '' : 'bad config',
++    }))
++    const controller = createRouterController({
++      enabled: true,
++      profiles,
++      supervisor,
++      homeDir: home,
++    })
++
++    const meta = await profiles.importFromUrl('https://example.com/a', 'Alpha')
++    await controller.onSourceImported(meta.id)
++    const base = (await profiles.list()).find(
++      (item) => item.managedBy === 'router',
++    )!
++    const before = await profiles.read(base.id)
++
++    valid = false
++    await profiles.update(meta.id, { name: 'Renamed' })
++    await expect(controller.onSourcesChanged()).rejects.toThrow(
++      'config validation failed',
++    )
++    expect(await profiles.read(base.id)).toBe(before)
++  })
++
++  it('keeps the last good provider cache when a remote refresh is corrupt', async () => {
++    const home = await tempHome()
++    const profiles = await storeFor(home, subscriptionFetch(SUB_A))
++    const { supervisor } = fakeSupervisor()
++    const controller = createRouterController({
++      enabled: true,
++      profiles,
++      supervisor,
++      homeDir: home,
++    })
++
++    const meta = await profiles.importFromUrl('https://example.com/a', 'Alpha')
++    await controller.onSourceImported(meta.id)
++    const before = await readdir(join(home, 'providers'))
++    await profiles.update(meta.id, { content: 'proxies: []\n' })
++    await controller.onSourcesChanged()
++
++    expect(await readdir(join(home, 'providers'))).toEqual(before)
++    const active = parse(
++      await readFile(join(home, 'active.yaml'), 'utf8'),
++    ) as Record<string, any>
++    expect(Object.keys(active['proxy-providers'])).toHaveLength(1)
++  })
++
++  it('writes local profiles as file providers', async () => {
++    const home = await tempHome()
++    const profiles = await storeFor(home)
++    const { supervisor } = fakeSupervisor()
++    const controller = createRouterController({
++      enabled: true,
++      profiles,
++      supervisor,
++      homeDir: home,
++    })
++    const local = await profiles.create({
++      name: 'Local',
++      content: SUB_B,
++      type: 'local',
++    })
++    await controller.onSourceImported(local.id)
++
++    const active = parse(
++      await readFile(join(home, 'active.yaml'), 'utf8'),
++    ) as Record<string, any>
++    const provider = Object.values(active['proxy-providers'])[0] as Record<
++      string,
++      any
++    >
++    expect(provider.type).toBe('file')
++    expect(provider.url).toBeUndefined()
++  })
++
++  it('bootstraps an existing subscription into the managed base without a restart', async () => {
++    const home = await tempHome()
++    const profiles = await storeFor(home, subscriptionFetch(SUB_A))
++    const { supervisor, restart, start } = fakeSupervisor()
++    const controller = createRouterController({
++      enabled: true,
++      profiles,
++      supervisor,
++      homeDir: home,
++    })
++
++    await profiles.importFromUrl('https://example.com/a', 'Alpha')
++    await controller.bootstrap()
++
++    expect(await profiles.getActiveId()).toBe(
++      (await profiles.list()).find((item) => item.managedBy === 'router')?.id,
++    )
++    expect(restart).not.toHaveBeenCalled()
++    expect(start).not.toHaveBeenCalled()
++  })
++
++  it('leaves a fresh install untouched until the first import', async () => {
++    const home = await tempHome()
++    const profiles = await storeFor(home)
++    const { supervisor } = fakeSupervisor()
++    const controller = createRouterController({
++      enabled: true,
++      profiles,
++      supervisor,
++      homeDir: home,
++    })
++    await controller.bootstrap()
++    expect(await profiles.list()).toEqual([])
++    await expect(profiles.getActiveId()).resolves.toBeUndefined()
++  })
++})
+diff --git a/packages/agent/src/router.ts b/packages/agent/src/router.ts
+new file mode 100644
+index 00000000..2dae22b8
+--- /dev/null
++++ b/packages/agent/src/router.ts
+@@ -0,0 +1,558 @@
++// packages/agent/src/router.ts
++import type {
++  KernelState,
++  MihomoSupervisor,
++  ProfileMeta,
++  ProfileStore,
++} from './types'
++import { randomUUID } from 'node:crypto'
++import {
++  mkdir,
++  mkdtemp,
++  readdir,
++  rename,
++  rm,
++  writeFile,
++} from 'node:fs/promises'
++import { join } from 'node:path'
++import { parse, stringify } from 'yaml'
++import { isPlainObject } from './merge'
++
++// AIO router mode: one managed base plus one mihomo proxy-provider per imported
++// subscription. MetaCubeXD itself can only activate one base profile at a time,
++// so combining subscriptions has to happen inside mihomo. Providers also give
++// us the unattended behaviour we need: each subscription refreshes on its own
++// schedule, a failed refresh keeps the last good provider file, and adding a
++// subscription does not require editing groups or rules.
++
++export const ROUTER_BASE_NAME = 'AIO Router'
++export const ROUTER_MAIN_GROUP = '🚀 节点选择'
++export const ROUTER_AUTO_GROUP = '♻️ 自动选择'
++export const ROUTER_TEST_URL = 'https://www.gstatic.com/generate_204'
++export const ROUTER_PROVIDER_PREFIX = 'router_'
++
++const DEFAULT_PROVIDER_INTERVAL_SEC = 86_400
++const DEFAULT_TUN_STACK = 'gvisor'
++const PROVIDERS_DIR = 'providers'
++
++// mihomo v1.19.x only accepts these stacks. `mips` is newer and validation
++// fails with "invalid tun stack", so never emit an unsupported value.
++const TUN_STACKS = new Set(['gvisor', 'system', 'mixed'])
++
++export interface RouterModeOptions {
++  enabled: boolean
++  lanIp?: string
++  lanCidr?: string
++  tunStack?: string
++  baseName?: string
++  providerIntervalSec?: number
++}
++
++export interface CreateRouterControllerOptions extends RouterModeOptions {
++  profiles: ProfileStore
++  supervisor: MihomoSupervisor
++  homeDir: string
++}
++
++export interface RouterSourceSpec {
++  id: string
++  name: string
++  providerName: string
++  groupName: string
++  type: 'remote' | 'local'
++  url?: string
++}
++
++export interface RouterRenderOptions {
++  lanIp?: string
++  lanCidr?: string
++  tunStack?: string
++  providerIntervalSec?: number
++}
++
++export interface RouterController {
++  readonly enabled: boolean
++  /** Prepare the managed base before the kernel starts (no restart). */
++  bootstrap: () => Promise<void>
++  /** True for the AIO-managed router base profile. */
++  isManaged: (meta: ProfileMeta) => boolean
++  /** True for a profile that can contribute proxies to the router base. */
++  isSource: (meta: ProfileMeta) => boolean
++  /** Validate a freshly imported source, then rebuild + activate the base. */
++  onSourceImported: (id: string) => Promise<void>
++  /** Rebuild provider files/base and activate. Used after enable/disable/delete. */
++  onSourcesChanged: () => Promise<KernelState | undefined>
++  /** Rebuild the cache/base after a manual subscription refresh. */
++  onSourceRefreshed: (id: string) => Promise<void>
++}
++
++type SourceSnapshot = RouterSourceSpec
++
++interface RouterSnapshot {
++  base?: ProfileMeta
++  sources: SourceSnapshot[]
++  providerFiles: Map<string, string>
++  // Provider caches to leave on disk when a remote refresh returned unusable
++  // content. The base still references the provider URL, so mihomo can retry
++  // without dropping the last good nodes.
++  preservedProviders: Set<string>
++  content: string
++}
++
++// The UI has a stack picker that historically included `Mips`. Normalize every
++// value we write so an unsupported choice can never brick router mode.
++export function normalizeRouterTunStack(stack?: string): string {
++  const lower = (stack ?? '').toLowerCase()
++  return TUN_STACKS.has(lower) ? lower : DEFAULT_TUN_STACK
++}
++
++// Parse a subscription/local profile into the only part mihomo's provider
++// parser consumes. Reject non-Clash content early instead of persisting a
++// provider that can never produce a node.
++export function parseRouterSource(content: string): unknown[] | undefined {
++  let parsed: unknown
++  try {
++    parsed = parse(content)
++  } catch {
++    return undefined
++  }
++  if (!isPlainObject(parsed)) return undefined
++  const proxies = parsed.proxies
++  if (!Array.isArray(proxies) || proxies.length === 0) return undefined
++  if (
++    !proxies.every(
++      (proxy) =>
++        isPlainObject(proxy) &&
++        typeof proxy.name === 'string' &&
++        proxy.name.length > 0,
++    )
++  ) {
++    return undefined
++  }
++  return proxies
++}
++
++function privateCidrs(lanCidr?: string): string[] {
++  const values = [
++    lanCidr,
++    '192.168.0.0/16',
++    '10.0.0.0/8',
++    '172.16.0.0/12',
++    '127.0.0.0/8',
++    '169.254.0.0/16',
++  ]
++  return [...new Set(values.filter((value): value is string => !!value))]
++}
++
++/**
++ * Render the managed router config. Pure function so the shape is unit-tested
++ * without touching the filesystem or the kernel.
++ */
++export function renderRouterConfig(
++  sources: RouterSourceSpec[],
++  options: RouterRenderOptions = {},
++): string {
++  const lanIp = options.lanIp ?? ''
++  const lanCidr = options.lanCidr ?? ''
++  const tunStack = normalizeRouterTunStack(options.tunStack)
++  const providerIntervalSec =
++    options.providerIntervalSec ?? DEFAULT_PROVIDER_INTERVAL_SEC
++  const excludes = privateCidrs(lanCidr)
++
++  const providers: Record<string, unknown> = {}
++  for (const source of sources) {
++    const provider: Record<string, unknown> = {
++      type: source.type === 'remote' ? 'http' : 'file',
++      path: `./${PROVIDERS_DIR}/${source.providerName}.yaml`,
++      override: { 'additional-prefix': `[${source.name}] ` },
++      'health-check': {
++        enable: true,
++        lazy: true,
++        url: ROUTER_TEST_URL,
++        interval: 600,
++      },
++    }
++    if (source.type === 'remote' && source.url) {
++      provider.url = source.url
++      provider.interval = providerIntervalSec
++      provider.header = { 'User-Agent': ['clash.meta'] }
++    }
++    providers[source.providerName] = provider
++  }
++
++  const groups: Array<Record<string, unknown>> = []
++  if (sources.length) {
++    groups.push({
++      name: ROUTER_MAIN_GROUP,
++      type: 'select',
++      proxies: [
++        ROUTER_AUTO_GROUP,
++        ...sources.map((source) => source.groupName),
++        'DIRECT',
++      ],
++      'include-all-providers': true,
++    })
++    groups.push({
++      name: ROUTER_AUTO_GROUP,
++      type: 'url-test',
++      'include-all-providers': true,
++      url: ROUTER_TEST_URL,
++      interval: 600,
++      tolerance: 50,
++    })
++    for (const source of sources) {
++      groups.push({
++        name: source.groupName,
++        type: 'select',
++        use: [source.providerName],
++      })
++    }
++  } else {
++    // No subscriptions yet (or all deleted): stay reachable and route direct.
++    // An empty include-all-providers group is invalid in mihomo, so emit a
++    // plain DIRECT selector instead.
++    groups.push({
++      name: ROUTER_MAIN_GROUP,
++      type: 'select',
++      proxies: ['DIRECT'],
++    })
++  }
++
++  const rules = [
++    ...excludes.map((cidr) => `IP-CIDR,${cidr},DIRECT,no-resolve`),
++    'GEOIP,CN,DIRECT',
++    `MATCH,${ROUTER_MAIN_GROUP}`,
++  ]
++
++  const origins = [
++    lanIp ? `http://${lanIp}:8080` : undefined,
++    'http://localhost:8080',
++    'http://127.0.0.1:8080',
++  ].filter((value): value is string => !!value)
++
++  const config: Record<string, unknown> = {
++    'allow-lan': false,
++    mode: 'rule',
++    'log-level': 'warning',
++    ipv6: false,
++    'external-controller-cors': {
++      'allow-private-network': true,
++      'allow-origins': origins,
++    },
++    dns: {
++      enable: true,
++      // Bind all interfaces: this survives a pending static-IP reboot and a
++      // DHCP address change. systemd-resolved only owns 127.0.0.53, not :53.
++      listen: '0.0.0.0:53',
++      ipv6: false,
++      'enhanced-mode': 'fake-ip',
++      'fake-ip-range': '198.18.0.1/16',
++      'fake-ip-filter': ['*.lan', '*.local', '+.local'],
++      'default-nameserver': ['223.5.5.5', '119.29.29.29'],
++      nameserver: [
++        'https://doh.pub/dns-query',
++        'https://dns.alidns.com/dns-query',
++      ],
++      'proxy-server-nameserver': ['223.5.5.5', '119.29.29.29'],
++    },
++    tun: {
++      enable: true,
++      stack: tunStack,
++      device: 'Meta',
++      'auto-route': true,
++      'auto-redirect': true,
++      'auto-detect-interface': true,
++      'route-exclude-address': excludes,
++      'dns-hijack': ['any:53', 'tcp://any:53'],
++    },
++    ...(sources.length ? { 'proxy-providers': providers } : {}),
++    'proxy-groups': groups,
++    rules,
++  }
++
++  return stringify(config)
++}
++
++function isSourceType(meta: ProfileMeta): boolean {
++  return meta.type === 'remote' || meta.type === 'local'
++}
++
++function providerNameFor(id: string): string {
++  return `${ROUTER_PROVIDER_PREFIX}${id.replace(/[^a-z0-9]/gi, '')}`
++}
++
++function sourceType(meta: ProfileMeta): 'remote' | 'local' {
++  return meta.type === 'remote' ? 'remote' : 'local'
++}
++
++// Stable display names are used in node prefixes and per-source group names.
++// Two profiles with the same name get " (2)", keeping group names unique.
++function uniqueNames(sources: ProfileMeta[]): Map<string, string> {
++  const counts = new Map<string, number>()
++  const names = new Map<string, string>()
++  for (const source of sources) {
++    const raw = source.name.trim() || source.id.slice(0, 8)
++    const count = (counts.get(raw) ?? 0) + 1
++    counts.set(raw, count)
++    names.set(source.id, count === 1 ? raw : `${raw} (${count})`)
++  }
++  return names
++}
++
++export function createRouterController(
++  opts: CreateRouterControllerOptions,
++): RouterController {
++  const {
++    profiles,
++    supervisor,
++    homeDir,
++    lanIp,
++    lanCidr,
++    baseName = ROUTER_BASE_NAME,
++    providerIntervalSec = DEFAULT_PROVIDER_INTERVAL_SEC,
++  } = opts
++  const providersDir = join(homeDir, PROVIDERS_DIR)
++
++  // Router mutations rebuild several files, so serialize them. Without this,
++  // two quick imports can interleave index reads and lose a provider.
++  let tail: Promise<unknown> = Promise.resolve()
++  function serialize<T>(action: () => Promise<T>): Promise<T> {
++    const result = tail.then(action, action)
++    tail = result.catch(() => {})
++    return result
++  }
++
++  async function atomicWrite(path: string, content: string): Promise<void> {
++    const temporary = `${path}.${randomUUID()}.tmp`
++    await writeFile(temporary, content, { mode: 0o600 })
++    try {
++      await rename(temporary, path)
++    } finally {
++      await rm(temporary, { force: true })
++    }
++  }
++
++  async function collectSnapshot(): Promise<RouterSnapshot> {
++    const list = await profiles.list()
++    const base = list.find((meta) => meta.managedBy === 'router')
++    const candidates = list.filter(
++      (meta) =>
++        meta.id !== base?.id &&
++        meta.enabled !== false &&
++        isSourceType(meta) &&
++        meta.managedBy !== 'router',
++    )
++    const names = uniqueNames(candidates)
++    const sources: SourceSnapshot[] = []
++    const providerFiles = new Map<string, string>()
++    const preservedProviders = new Set<string>()
++
++    for (const meta of candidates) {
++      const raw = await profiles.read(meta.id).catch(() => '')
++      const proxies = parseRouterSource(raw)
++      // A blank local profile is not a subscription source and a broken local
++      // file has no URL to fall back to. Remotes are different: keep the
++      // provider (and its last good cache) so one bad refresh cannot drop the
++      // whole source.
++      if (!proxies && meta.type !== 'remote') continue
++      const name = names.get(meta.id) ?? meta.name
++      const providerName = providerNameFor(meta.id)
++      sources.push({
++        id: meta.id,
++        name,
++        providerName,
++        groupName: `📦 ${name}`,
++        type: sourceType(meta),
++        ...(meta.url ? { url: meta.url } : {}),
++      })
++      if (proxies) providerFiles.set(providerName, stringify({ proxies }))
++      else preservedProviders.add(providerName)
++    }
++
++    return {
++      base,
++      sources,
++      providerFiles,
++      preservedProviders,
++      content: renderRouterConfig(sources, {
++        lanIp,
++        lanCidr,
++        tunStack: opts.tunStack,
++        providerIntervalSec,
++      }),
++    }
++  }
++
++  async function writeProviderFiles(
++    providerFiles: Map<string, string>,
++    preservedProviders: Set<string>,
++  ): Promise<void> {
++    await mkdir(providersDir, { recursive: true })
++    const desired = new Set(
++      [...providerFiles.keys()].map((name) => `${name}.yaml`),
++    )
++    const preserved = new Set(
++      [...preservedProviders].map((name) => `${name}.yaml`),
++    )
++    for (const entry of await readdir(providersDir)) {
++      if (!entry.startsWith(ROUTER_PROVIDER_PREFIX)) continue
++      if (desired.has(entry) || preserved.has(entry)) continue
++      await rm(join(providersDir, entry), { force: true })
++    }
++    for (const [name, content] of providerFiles) {
++      await atomicWrite(join(providersDir, `${name}.yaml`), content)
++    }
++  }
++
++  async function ensureBase(
++    snapshot: RouterSnapshot,
++  ): Promise<
++    { base: ProfileMeta; previous?: string; changed: boolean } | undefined
++  > {
++    if (!snapshot.base) {
++      if (!snapshot.sources.length) return undefined
++      const base = await profiles.create({
++        name: baseName,
++        type: 'local',
++        content: snapshot.content,
++        managedBy: 'router',
++      })
++      return { base, changed: true }
++    }
++    const previous = await profiles.read(snapshot.base.id).catch(() => '')
++    const changed = previous !== snapshot.content
++    if (changed) {
++      await profiles.update(snapshot.base.id, { content: snapshot.content })
++    }
++    return { base: snapshot.base, previous, changed }
++  }
++
++  async function validateContent(
++    content: string,
++  ): Promise<{ valid: boolean; message: string }> {
++    const dir = await mkdtemp(join(homeDir, '.router-'))
++    try {
++      const candidate = join(dir, 'candidate.yaml')
++      await writeFile(candidate, content, { mode: 0o600 })
++      return await supervisor.validate(candidate)
++    } finally {
++      await rm(dir, { recursive: true, force: true })
++    }
++  }
++
++  function restartKernel(): Promise<KernelState> {
++    const status = supervisor.getState().status
++    if (status === 'stopped' || status === 'errored') return supervisor.start()
++    return supervisor.restart()
++  }
++
++  async function applySnapshot(
++    reason: string,
++    options: { restart: boolean },
++  ): Promise<KernelState | undefined> {
++    const snapshot = await collectSnapshot()
++    const ensured = await ensureBase(snapshot)
++    if (!ensured) return undefined
++    const { base, previous, changed } = ensured
++
++    // Write provider caches before validation so `mihomo -t` sees the nodes it
++    // will run with. Remote providers still refresh from their URL later.
++    await writeProviderFiles(
++      snapshot.providerFiles,
++      snapshot.preservedProviders,
++    )
++
++    const activeId = await profiles.getActiveId()
++    const needsActivation = changed || activeId !== base.id
++    if (!needsActivation) {
++      if (options.restart) return restartKernel()
++      return supervisor.getState()
++    }
++
++    // Compose with enabled merge/script overlays, validate a temp candidate, and
++    // only then replace active.yaml. A bad template/source leaves the previous
++    // router config and the running kernel untouched.
++    const composed = await profiles.compose(base.id)
++    const validation = await validateContent(composed.content)
++    if (!validation.valid) {
++      if (changed) {
++        if (previous === undefined) {
++          await profiles.delete(base.id).catch(() => {})
++        } else {
++          await profiles.update(base.id, { content: previous }).catch(() => {})
++        }
++      }
++      throw new Error(
++        `[router] ${reason}: config validation failed: ${validation.message}`,
++      )
++    }
++    if (activeId !== base.id) {
++      // First activation / migration away from a subscription. setActive
++      // recomposes and writes active.yaml; the candidate was just validated.
++      await profiles.setActive(base.id)
++    } else {
++      // Re-activating the base: commit only if its composition did not change
++      // while validation was running.
++      const committed = await profiles.setActiveIfCurrent(
++        base.id,
++        composed.content,
++      )
++      if (!committed) {
++        throw new Error(
++          `[router] ${reason}: active profile changed during sync`,
++        )
++      }
++    }
++    if (options.restart) return restartKernel()
++    return supervisor.getState()
++  }
++
++  const controller: RouterController = {
++    enabled: opts.enabled,
++
++    bootstrap() {
++      return serialize(async () => {
++        await applySnapshot('bootstrap', { restart: false })
++      })
++    },
++
++    isManaged(meta) {
++      return meta.managedBy === 'router'
++    },
++
++    isSource(meta) {
++      return isSourceType(meta) && meta.managedBy !== 'router'
++    },
++
++    onSourceImported(id) {
++      return serialize(async () => {
++        const meta = (await profiles.list()).find((item) => item.id === id)
++        if (!meta) throw new Error(`[router] profile not found: ${id}`)
++        const raw = await profiles.read(id)
++        if (!parseRouterSource(raw)) {
++          throw new Error(
++            '[router] subscription is not Clash YAML with a non-empty proxies list',
++          )
++        }
++        await applySnapshot('import', { restart: true })
++      })
++    },
++
++    onSourcesChanged() {
++      return serialize(() =>
++        applySnapshot('sources changed', { restart: true }),
++      )
++    },
++
++    onSourceRefreshed(id) {
++      return serialize(async () => {
++        // Manual refresh is rare; rebuild the provider cache and restart once.
++        // Automatic 24h provider updates are handled inside mihomo and do NOT
++        // restart the kernel.
++        await applySnapshot(`source ${id} refreshed`, { restart: true })
++      })
++    },
++  }
++
++  return controller
++}
+diff --git a/packages/agent/src/types.ts b/packages/agent/src/types.ts
+index 2bf5a635..2a641374 100644
+--- a/packages/agent/src/types.ts
++++ b/packages/agent/src/types.ts
+@@ -109,7 +109,9 @@ export interface ProfileMeta {
+   // Managed merge overlays may be scoped to one base profile. Legacy merges
+   // omit this field and remain global.
+   baseProfileId?: string
+-  managedBy?: 'visual-editor'
++  // 'router' marks the AIO-managed router base. It is regenerated from the
++  // imported subscription sources and is read-only through the HTTP API.
++  managedBy?: 'visual-editor' | 'router'
+   editorStatus?: 'clean' | 'conflicted'
+   updatedAt: number
+   subscriptionInfo?: {
+@@ -128,7 +130,7 @@ export interface ProfileStore {
+     content?: string
+     type?: 'local' | 'merge' | 'script'
+     baseProfileId?: string
+-    managedBy?: 'visual-editor'
++    managedBy?: 'visual-editor' | 'router'
+     editorStatus?: 'clean' | 'conflicted'
+   }) => Promise<ProfileMeta>
+   update: (
+diff --git a/packages/ui/components/OnboardingWizard.vue b/packages/ui/components/OnboardingWizard.vue
+index d70e8a7e..6a8dfed4 100644
+--- a/packages/ui/components/OnboardingWizard.vue
++++ b/packages/ui/components/OnboardingWizard.vue
+@@ -121,8 +121,12 @@ const onImported = async (meta: ProfileMeta) => {
+   try {
+     // Activate immediately so the freshly imported subscription is LIVE — the
+     // "working proxy in under a minute" goal. On a fresh install there are no
+-    // live connections, so the activation's connection reset is a no-op.
+-    await api.activateProfile(meta.id)
++    // live connections, so the activation's connection reset is a no-op. In
++    // router mode the import route already created/activated the managed base;
++    // activating the raw subscription here would detach that base.
++    if (!hasFeature('router-mode')) {
++      await api.activateProfile(meta.id)
++    }
+   } catch {
+     // Activation failure is surfaced by the hero's own toast; still advance —
+     // the profile exists now, so the gate would hide the wizard regardless.
+@@ -350,7 +354,7 @@ onUnmounted(() => {
+                 </button>
+               </template>
+               <template v-else-if="currentStep === 'systemProxy'">
+-                <Button class="btn-sm btn-primary" @click="next">
++                <Button class="btn-primary btn-sm" @click="next">
+                   {{ t('onboardingNext') }}
+                 </Button>
+               </template>
+@@ -358,7 +362,7 @@ onUnmounted(() => {
+                 <button class="ob-skip" @click="finish">
+                   {{ t('onboardingFinish') }}
+                 </button>
+-                <Button class="btn-sm btn-primary" @click="goToProxies">
++                <Button class="btn-primary btn-sm" @click="goToProxies">
+                   {{ t('onboardingGoToProxies') }}
+                 </Button>
+               </template>
+diff --git a/packages/ui/composables/__tests__/useControlApi.spec.ts b/packages/ui/composables/__tests__/useControlApi.spec.ts
+index a33f4498..d6aae171 100644
+--- a/packages/ui/composables/__tests__/useControlApi.spec.ts
++++ b/packages/ui/composables/__tests__/useControlApi.spec.ts
+@@ -115,6 +115,7 @@ describe('composables/useControlApi methods', () => {
+     await useControlApi().createProfile({ name: 'p1', content: 'a: 1' })
+     expect(post).toHaveBeenCalledWith('profiles', {
+       json: { name: 'p1', content: 'a: 1' },
++      timeout: 360_000,
+     })
+   })
+ 
+@@ -122,6 +123,7 @@ describe('composables/useControlApi methods', () => {
+     await useControlApi().createProfile({ name: 'js', type: 'script' })
+     expect(post).toHaveBeenCalledWith('profiles', {
+       json: { name: 'js', type: 'script' },
++      timeout: 360_000,
+     })
+   })
+ 
+@@ -134,6 +136,7 @@ describe('composables/useControlApi methods', () => {
+     await useControlApi().updateProfile('id1', { content: 'b: 2' })
+     expect(put).toHaveBeenCalledWith('profiles/id1', {
+       json: { content: 'b: 2' },
++      timeout: 360_000,
+     })
+   })
+ 
+@@ -141,12 +144,13 @@ describe('composables/useControlApi methods', () => {
+     await useControlApi().updateProfile('id1', { updateInterval: 60 })
+     expect(put).toHaveBeenCalledWith('profiles/id1', {
+       json: { updateInterval: 60 },
++      timeout: 360_000,
+     })
+   })
+ 
+   it('deleteProfile() DELETEs profiles/:id', async () => {
+     await useControlApi().deleteProfile('id1')
+-    expect(del).toHaveBeenCalledWith('profiles/id1')
++    expect(del).toHaveBeenCalledWith('profiles/id1', { timeout: 360_000 })
+   })
+ 
+   it('rollbackKernel() POSTs kernel/rollback (#2109)', async () => {
+@@ -170,7 +174,7 @@ describe('composables/useControlApi methods', () => {
+     await useControlApi().importProfile('http://sub', 'subname')
+     expect(post).toHaveBeenCalledWith('profiles/import', {
+       json: { url: 'http://sub', name: 'subname' },
+-      timeout: 45_000,
++      timeout: 360_000,
+     })
+   })
+ 
+@@ -184,7 +188,7 @@ describe('composables/useControlApi methods', () => {
+   it('refreshProfile() POSTs profiles/:id/refresh', async () => {
+     await useControlApi().refreshProfile('id1')
+     expect(post).toHaveBeenCalledWith('profiles/id1/refresh', {
+-      timeout: 45_000,
++      timeout: 360_000,
+     })
+   })
+ 
+diff --git a/packages/ui/composables/__tests__/useTunConfig.spec.ts b/packages/ui/composables/__tests__/useTunConfig.spec.ts
+index 9477de21..2328cd24 100644
+--- a/packages/ui/composables/__tests__/useTunConfig.spec.ts
++++ b/packages/ui/composables/__tests__/useTunConfig.spec.ts
+@@ -263,18 +263,22 @@ describe('composables/useTunConfig', () => {
+ })
+ 
+ describe('tun stack options', () => {
+-  it('offers only stacks mihomo accepts (no lwIP)', () => {
+-    expect(TUN_STACKS).toEqual(['Mixed', 'gVisor', 'System', 'Mips'])
++  it('offers only stacks the bundled kernel accepts', () => {
++    expect(TUN_STACKS).toEqual(['Mixed', 'gVisor', 'System'])
+     expect(TUN_STACKS.map((s) => s.toLowerCase())).not.toContain('lwip')
++    expect(TUN_STACKS.map((s) => s.toLowerCase())).not.toContain('mips')
+   })
+ 
+   it('matches the reported stack case-insensitively', () => {
+-    expect(normalizeTunStack('Mips')).toBe('Mips')
+-    expect(normalizeTunStack('mips')).toBe('Mips')
+     expect(normalizeTunStack('gvisor')).toBe('gVisor')
+     expect(normalizeTunStack('SYSTEM')).toBe('System')
+   })
+ 
++  it('drops stacks the bundled kernel rejects', () => {
++    expect(normalizeTunStack('Mips')).toBe('Mixed')
++    expect(normalizeTunStack('lwip')).toBe('Mixed')
++  })
++
+   it('falls back to Mixed when no stack is reported', () => {
+     expect(normalizeTunStack(undefined)).toBe('Mixed')
+     expect(normalizeTunStack('')).toBe('Mixed')
+diff --git a/packages/ui/composables/useControlApi.ts b/packages/ui/composables/useControlApi.ts
+index 0c683d22..4a61e36b 100644
+--- a/packages/ui/composables/useControlApi.ts
++++ b/packages/ui/composables/useControlApi.ts
+@@ -22,7 +22,9 @@ import ky from 'ky'
+ // Keep ordinary control requests on the client's 15s default. These finite
+ // budgets outlive the agent's 300s validator, 5s reap grace, kernel lifecycle,
+ // and (for refresh+apply) bounded subscription fetch (#2118, #2121).
+-const PROFILE_SUBSCRIPTION_TIMEOUT = 45_000
++// Router mode validates the composed base after an import/refresh, which can
++// include mihomo's first-run GEO download; do not cut that off at 45s.
++const PROFILE_SUBSCRIPTION_TIMEOUT = 360_000
+ const PROFILE_VALIDATE_TIMEOUT = 330_000
+ const PROFILE_ACTIVATE_TIMEOUT = 360_000
+ const PROFILE_REFRESH_AND_ACTIVATE_TIMEOUT = 390_000
+@@ -102,7 +104,15 @@ export function useControlApi() {
+       name: string
+       content?: string
+       type?: 'local' | 'merge' | 'script'
+-    }) => client.post('profiles', { json: body }).json<ProfileMeta>(),
++    }) =>
++      client
++        .post('profiles', {
++          json: body,
++          // Router mode may validate + restart the kernel for a local/file
++          // subscription import; keep the default 15s only for UI-only calls.
++          timeout: PROFILE_ACTIVATE_TIMEOUT,
++        })
++        .json<ProfileMeta>(),
+     getProfile: (id: string) =>
+       client.get(`profiles/${id}`).json<ProfileDetail>(),
+     updateProfile: (
+@@ -114,12 +124,22 @@ export function useControlApi() {
+         // minutes; remote-only. 0 disables auto-update.
+         updateInterval?: number
+       },
+-    ) => client.put(`profiles/${id}`, { json: body }).json<ProfileMeta>(),
++    ) =>
++      client
++        .put(`profiles/${id}`, {
++          json: body,
++          // Router source enable/disable and merge edits can restart the kernel.
++          timeout: PROFILE_ACTIVATE_TIMEOUT,
++        })
++        .json<ProfileMeta>(),
+     // DELETE returns 204 No Content — there is no body to parse. Chaining
+     // .json() on an empty 204 throws "Unexpected end of JSON input" and makes a
+     // successful delete look like a failure (#2110).
+     deleteProfile: async (id: string) => {
+-      await client.delete(`profiles/${id}`)
++      await client.delete(`profiles/${id}`, {
++        // Deleting a router source rebuilds the base and restarts the kernel.
++        timeout: PROFILE_ACTIVATE_TIMEOUT,
++      })
+     },
+     duplicateProfile: (id: string, name?: string) =>
+       client
+diff --git a/packages/ui/composables/useProfiles.ts b/packages/ui/composables/useProfiles.ts
+index 19569a84..4f21a711 100644
+--- a/packages/ui/composables/useProfiles.ts
++++ b/packages/ui/composables/useProfiles.ts
+@@ -32,7 +32,13 @@ export function useProfiles() {
+   // script transforms are composed onto whichever base is active. Keep them in
+   // separate lists so the page can render them in distinct sections.
+   const baseProfiles = computed(() =>
+-    profiles.value.filter((p) => p.type !== 'merge' && p.type !== 'script'),
++    profiles.value
++      .filter((p) => p.type !== 'merge' && p.type !== 'script')
++      // Router mode: keep the managed base above the subscription sources.
++      .sort(
++        (a, b) =>
++          Number(b.managedBy === 'router') - Number(a.managedBy === 'router'),
++      ),
+   )
+   const mergeProfiles = computed(() =>
+     profiles.value.filter((p) => p.type === 'merge'),
+@@ -193,6 +199,20 @@ export function useProfiles() {
+     }
+   }
+ 
++  // Router mode: enable/disable one subscription source. The agent owns the
++  // provider rebuild and kernel restart, so this must NOT call recompose().
++  const setSourceEnabled = async (id: string, enabled: boolean) => {
++    try {
++      await api.updateProfile(id, { enabled })
++      await refresh()
++      toast.success(t('profilesRouterSourceUpdated'))
++    } catch (e) {
++      toast.error(t('profilesActionFailed'), {
++        description: controlErrorMessage(e),
++      })
++    }
++  }
++
+   // Save merge overlay content, then re-compose the active config.
+   const saveMerge = async (id: string, content: string) => {
+     try {
+@@ -254,6 +274,7 @@ export function useProfiles() {
+     saveScript,
+     setEnabled,
+     setScriptEnabled,
++    setSourceEnabled,
+     setUpdateInterval,
+     load,
+     validate,
+diff --git a/packages/ui/composables/useTunConfig.ts b/packages/ui/composables/useTunConfig.ts
+index 1d788a12..3ff6950e 100644
+--- a/packages/ui/composables/useTunConfig.ts
++++ b/packages/ui/composables/useTunConfig.ts
+@@ -10,13 +10,18 @@ declare function useI18n(): { t: (key: string, named?: object) => string }
+ // Stacks mihomo accepts for `tun.stack` (constant/tun.go), in the casing
+ // GET /configs reports; it parses them case-insensitively. lwIP was dropped in
+ // mihomo 1.18 and is now refused as "invalid tun stack".
+-export const TUN_STACKS = ['Mixed', 'gVisor', 'System', 'Mips']
++// mihomo v1.19.x rejects `mips` with "invalid tun stack"; only offer stacks the
++// bundled kernel actually accepts.
++export const TUN_STACKS = ['Mixed', 'gVisor', 'System']
+ 
+ // Map a reported stack onto its option regardless of case (the agent and
+ // profiles use lowercase). Unknown values are kept so the select shows them.
+ export function normalizeTunStack(stack?: string | null): string {
+   if (!stack) return 'Mixed'
+   const lower = stack.toLowerCase()
++  // Old configs/UI builds may still report these. mihomo v1.19.x refuses
++  // `mips` and lwIP was removed in 1.18, so don't echo them back.
++  if (lower === 'mips' || lower === 'lwip') return 'Mixed'
+   return TUN_STACKS.find((s) => s.toLowerCase() === lower) ?? stack
+ }
+ 
+diff --git a/packages/ui/i18n/locales/en.json b/packages/ui/i18n/locales/en.json
+index 2d45d436..4d0149af 100644
+--- a/packages/ui/i18n/locales/en.json
++++ b/packages/ui/i18n/locales/en.json
+@@ -613,6 +613,13 @@
+   "profilesAutoUpdateOff": "Off",
+   "profilesAutoUpdateMinutes": "{n} min",
+   "profilesAutoUpdateHours": "{n} h",
++  "profilesRouterMode": "Bypass-router mode",
++  "profilesRouterModeHelp": "Import a subscription below. The managed router config, TUN, DNS, groups and forwarding are configured automatically. Add more subscriptions through the same box; no merge profile or YAML editing is needed.",
++  "profilesRouterSource": "Subscription source",
++  "profilesRouterSourceEnabled": "Use this subscription",
++  "profilesRouterSourceUpdated": "Subscription source updated",
++  "profilesRouterAutoUpdate": "Nodes update automatically in the kernel (every 24 hours).",
++  "profilesManaged": "Managed",
+   "profilesUpdated": "Updated {time}",
+   "profilesActivated": "Profile activated",
+   "profilesActionFailed": "Action failed",
+diff --git a/packages/ui/i18n/locales/fa.json b/packages/ui/i18n/locales/fa.json
+index 753b0b5a..7df2b107 100644
+--- a/packages/ui/i18n/locales/fa.json
++++ b/packages/ui/i18n/locales/fa.json
+@@ -613,6 +613,13 @@
+   "profilesAutoUpdateOff": "خاموش",
+   "profilesAutoUpdateMinutes": "{n} دقیقه",
+   "profilesAutoUpdateHours": "{n} ساعت",
++  "profilesRouterMode": "Bypass-router mode",
++  "profilesRouterModeHelp": "Import a subscription below. The managed router config, TUN, DNS, groups and forwarding are configured automatically. Add more subscriptions through the same box; no merge profile or YAML editing is needed.",
++  "profilesRouterSource": "Subscription source",
++  "profilesRouterSourceEnabled": "Use this subscription",
++  "profilesRouterSourceUpdated": "Subscription source updated",
++  "profilesRouterAutoUpdate": "Nodes update automatically in the kernel (every 24 hours).",
++  "profilesManaged": "Managed",
+   "profilesUpdated": "به‌روزرسانی {time}",
+   "profilesActivated": "نمایه فعال شد",
+   "profilesActionFailed": "عملیات ناموفق بود",
+diff --git a/packages/ui/i18n/locales/fr.json b/packages/ui/i18n/locales/fr.json
+index 89a55179..967a9e6a 100644
+--- a/packages/ui/i18n/locales/fr.json
++++ b/packages/ui/i18n/locales/fr.json
+@@ -613,6 +613,13 @@
+   "profilesAutoUpdateOff": "Désactivé",
+   "profilesAutoUpdateMinutes": "{n} min",
+   "profilesAutoUpdateHours": "{n} h",
++  "profilesRouterMode": "Bypass-router mode",
++  "profilesRouterModeHelp": "Import a subscription below. The managed router config, TUN, DNS, groups and forwarding are configured automatically. Add more subscriptions through the same box; no merge profile or YAML editing is needed.",
++  "profilesRouterSource": "Subscription source",
++  "profilesRouterSourceEnabled": "Use this subscription",
++  "profilesRouterSourceUpdated": "Subscription source updated",
++  "profilesRouterAutoUpdate": "Nodes update automatically in the kernel (every 24 hours).",
++  "profilesManaged": "Managed",
+   "profilesUpdated": "Mis à jour {time}",
+   "profilesActivated": "Profil activé",
+   "profilesActionFailed": "Échec de l'opération",
+diff --git a/packages/ui/i18n/locales/ja.json b/packages/ui/i18n/locales/ja.json
+index 17f6ff49..fcdd04c4 100644
+--- a/packages/ui/i18n/locales/ja.json
++++ b/packages/ui/i18n/locales/ja.json
+@@ -613,6 +613,13 @@
+   "profilesAutoUpdateOff": "オフ",
+   "profilesAutoUpdateMinutes": "{n} 分",
+   "profilesAutoUpdateHours": "{n} 時間",
++  "profilesRouterMode": "Bypass-router mode",
++  "profilesRouterModeHelp": "Import a subscription below. The managed router config, TUN, DNS, groups and forwarding are configured automatically. Add more subscriptions through the same box; no merge profile or YAML editing is needed.",
++  "profilesRouterSource": "Subscription source",
++  "profilesRouterSourceEnabled": "Use this subscription",
++  "profilesRouterSourceUpdated": "Subscription source updated",
++  "profilesRouterAutoUpdate": "Nodes update automatically in the kernel (every 24 hours).",
++  "profilesManaged": "Managed",
+   "profilesUpdated": "{time}に更新",
+   "profilesActivated": "プロファイルを有効化しました",
+   "profilesActionFailed": "操作に失敗しました",
+diff --git a/packages/ui/i18n/locales/ko.json b/packages/ui/i18n/locales/ko.json
+index 0112c9b5..68302622 100644
+--- a/packages/ui/i18n/locales/ko.json
++++ b/packages/ui/i18n/locales/ko.json
+@@ -613,6 +613,13 @@
+   "profilesAutoUpdateOff": "꺼짐",
+   "profilesAutoUpdateMinutes": "{n}분",
+   "profilesAutoUpdateHours": "{n}시간",
++  "profilesRouterMode": "Bypass-router mode",
++  "profilesRouterModeHelp": "Import a subscription below. The managed router config, TUN, DNS, groups and forwarding are configured automatically. Add more subscriptions through the same box; no merge profile or YAML editing is needed.",
++  "profilesRouterSource": "Subscription source",
++  "profilesRouterSourceEnabled": "Use this subscription",
++  "profilesRouterSourceUpdated": "Subscription source updated",
++  "profilesRouterAutoUpdate": "Nodes update automatically in the kernel (every 24 hours).",
++  "profilesManaged": "Managed",
+   "profilesUpdated": "{time}에 업데이트됨",
+   "profilesActivated": "프로필을 활성화했습니다",
+   "profilesActionFailed": "작업에 실패했습니다",
+diff --git a/packages/ui/i18n/locales/ru.json b/packages/ui/i18n/locales/ru.json
+index a923938a..5b9285a6 100644
+--- a/packages/ui/i18n/locales/ru.json
++++ b/packages/ui/i18n/locales/ru.json
+@@ -557,6 +557,13 @@
+   "profilesRefresh": "Обновить",
+   "profilesRefreshed": "Подписка обновлена",
+   "profilesRefreshFailed": "Не удалось обновить подписку",
++  "profilesRouterMode": "Bypass-router mode",
++  "profilesRouterModeHelp": "Import a subscription below. The managed router config, TUN, DNS, groups and forwarding are configured automatically. Add more subscriptions through the same box; no merge profile or YAML editing is needed.",
++  "profilesRouterSource": "Subscription source",
++  "profilesRouterSourceEnabled": "Use this subscription",
++  "profilesRouterSourceUpdated": "Subscription source updated",
++  "profilesRouterAutoUpdate": "Nodes update automatically in the kernel (every 24 hours).",
++  "profilesManaged": "Managed",
+   "profilesUpdated": "Обновлено {time}",
+   "profilesActivated": "Профиль активирован",
+   "profilesActionFailed": "Не удалось выполнить действие",
+diff --git a/packages/ui/i18n/locales/zh.json b/packages/ui/i18n/locales/zh.json
+index 5c081956..188769ae 100644
+--- a/packages/ui/i18n/locales/zh.json
++++ b/packages/ui/i18n/locales/zh.json
+@@ -613,6 +613,13 @@
+   "profilesAutoUpdateOff": "关闭",
+   "profilesAutoUpdateMinutes": "{n} 分钟",
+   "profilesAutoUpdateHours": "{n} 小时",
++  "profilesRouterMode": "旁路由模式",
++  "profilesRouterModeHelp": "在下方导入订阅即可。路由器配置、TUN、DNS、分组和转发会自动完成。以后继续在同一个输入框添加订阅，不需要建合并覆盖或修改 YAML。",
++  "profilesRouterSource": "订阅源",
++  "profilesRouterSourceEnabled": "启用此订阅",
++  "profilesRouterSourceUpdated": "订阅源已更新",
++  "profilesRouterAutoUpdate": "节点由内核自动更新（每 24 小时）。",
++  "profilesManaged": "受管",
+   "profilesUpdated": "更新于 {time}",
+   "profilesActivated": "配置已激活",
+   "profilesActionFailed": "操作失败",
+diff --git a/packages/ui/pages/profiles.vue b/packages/ui/pages/profiles.vue
+index c0d90955..6c02325a 100644
+--- a/packages/ui/pages/profiles.vue
++++ b/packages/ui/pages/profiles.vue
+@@ -18,6 +18,8 @@ import { controlErrorMessage } from '~/utils/controlError'
+ const { t, locale } = useI18n()
+ const router = useRouter()
+ const { hasFeature, ready } = useControlInfo()
++// AIO bypass-router deployments manage one base + N subscription sources.
++const routerMode = computed(() => hasFeature('router-mode'))
+ const kernelStore = useKernelStore()
+ const { isShareable, qrSvg } = useShareQr()
+ const { copy: copyToClipboard } = useClipboard()
+@@ -49,6 +51,7 @@ const {
+   saveScript,
+   setEnabled,
+   setScriptEnabled,
++  setSourceEnabled,
+   setUpdateInterval,
+   load,
+   validate,
+@@ -257,6 +260,18 @@ const onToggleScript = (id: string, event: Event) => {
+   return withBusy(`toggle:${id}`, () => setScriptEnabled(id, next))
+ }
+ 
++const onToggleSource = (id: string, event: Event) => {
++  const next = (event.target as HTMLInputElement).checked
++  return withBusy(`source-toggle:${id}`, () => setSourceEnabled(id, next))
++}
++
++const isRouterBase = (p: ProfileMeta) => p.managedBy === 'router'
++const isRouterSource = (p: ProfileMeta) =>
++  routerMode.value &&
++  p.managedBy !== 'router' &&
++  p.type !== 'merge' &&
++  p.type !== 'script'
++
+ // The prominent import hero (ProfileImportHero) owns the actual import; it runs
+ // its own useProfiles + refreshes the shared profile-status singleton. Refresh
+ // THIS page's per-instance list too so the base-profile grid below updates.
+@@ -357,6 +372,21 @@ const onCopyShareUrl = async () => {
+       <!-- Prominent subscription import (shared with the first-run wizard) -->
+       <ProfileImportHero @imported="onHeroImported" />
+ 
++      <!-- Router mode: importing one subscription is the entire setup. The
++           managed base + providers are rebuilt by the agent; users never need
++           to create a merge overlay or edit YAML. -->
++      <div
++        v-if="routerMode"
++        class="rounded-xl border border-primary/30 bg-primary/5 p-3 text-sm"
++      >
++        <div class="font-semibold text-base-content">
++          {{ t('profilesRouterMode') }}
++        </div>
++        <p class="mt-0.5 text-base-content/60">
++          {{ t('profilesRouterModeHelp') }}
++        </p>
++      </div>
++
+       <!-- Profile list -->
+       <div v-if="loading" class="grid grid-cols-1 gap-3 md:grid-cols-2">
+         <div
+@@ -398,6 +428,18 @@ const onCopyShareUrl = async () => {
+               >
+                 {{ t('visualEditorConflicts') }}
+               </span>
++              <span
++                v-if="p.managedBy === 'router'"
++                class="badge badge-sm badge-info"
++              >
++                {{ t('profilesManaged') }}
++              </span>
++              <span
++                v-else-if="isRouterSource(p)"
++                class="badge badge-ghost badge-sm"
++              >
++                {{ t('profilesRouterSource') }}
++              </span>
+               <span class="badge badge-ghost badge-sm">{{ p.type }}</span>
+             </div>
+           </div>
+@@ -415,9 +457,16 @@ const onCopyShareUrl = async () => {
+           <!-- Auto-update interval (remote only). The AIO server ticks every
+                minute and refreshes remote profiles whose interval elapsed; a
+                refreshed active profile re-activates so the new subscription
+-               routes immediately (#2107). -->
++               routes immediately (#2107). Router sources are refreshed by
++               mihomo's provider scheduler instead. -->
++          <p
++            v-if="p.type === 'remote' && routerMode"
++            class="mt-2 text-xs text-base-content/50"
++          >
++            {{ t('profilesRouterAutoUpdate') }}
++          </p>
+           <div
+-            v-if="p.type === 'remote'"
++            v-else-if="p.type === 'remote'"
+             class="mt-2 flex items-center gap-2 text-sm"
+           >
+             <label
+@@ -445,9 +494,29 @@ const onCopyShareUrl = async () => {
+             </select>
+           </div>
+ 
++          <label
++            v-if="isRouterSource(p)"
++            class="mt-2 flex items-center gap-2 text-sm"
++          >
++            <input
++              type="checkbox"
++              class="toggle toggle-sm"
++              :checked="p.enabled !== false"
++              :disabled="isBusy(`source-toggle:${p.id}`)"
++              @change="onToggleSource(p.id, $event)"
++            />
++            <span class="text-base-content/70">
++              {{ t('profilesRouterSourceEnabled') }}
++            </span>
++          </label>
++
+           <div class="mt-3 flex flex-wrap gap-2">
+             <Button
+-              v-if="hasFeature('visual-config-editor')"
++              v-if="
++                hasFeature('visual-config-editor') &&
++                !isRouterBase(p) &&
++                !isRouterSource(p)
++              "
+               class="btn-primary btn-xs"
+               :icon="IconBraces"
+               @click="router.push(`/profiles/${p.id}/edit`)"
+@@ -455,6 +524,7 @@ const onCopyShareUrl = async () => {
+               {{ t('visualEditor') }}
+             </Button>
+             <Button
++              v-if="!isRouterBase(p) && !isRouterSource(p)"
+               class="btn-xs"
+               :icon="IconPencil"
+               :loading="isBusy(`edit:${p.id}`)"
+@@ -472,7 +542,7 @@ const onCopyShareUrl = async () => {
+               {{ t('profilesRefresh') }}
+             </Button>
+             <Button
+-              v-if="p.type === 'remote'"
++              v-if="p.type === 'remote' && !routerMode"
+               class="btn-success btn-xs"
+               :icon="IconRefresh"
+               :loading="isBusy(`refresh-apply:${p.id}`)"
+@@ -481,6 +551,7 @@ const onCopyShareUrl = async () => {
+               {{ t('profilesRefreshAndApply') }}
+             </Button>
+             <Button
++              v-if="!isRouterBase(p)"
+               class="btn-xs"
+               :icon="IconCopy"
+               :loading="isBusy(`duplicate:${p.id}`)"
+@@ -489,7 +560,7 @@ const onCopyShareUrl = async () => {
+               {{ t('profilesDuplicate') }}
+             </Button>
+             <Button
+-              v-if="p.id !== activeBaseId"
++              v-if="p.id !== activeBaseId && !routerMode"
+               class="btn-success btn-xs"
+               :icon="IconPlayerPlay"
+               :loading="isBusy(`activate:${p.id}`)"
+@@ -506,6 +577,7 @@ const onCopyShareUrl = async () => {
+               {{ t('profilesShare') }}
+             </Button>
+             <Button
++              v-if="!isRouterBase(p)"
+               class="btn-error btn-xs"
+               :icon="IconTrash"
+               :loading="isBusy(`delete:${p.id}`)"
+diff --git a/packages/ui/types/control.ts b/packages/ui/types/control.ts
+index 5f4be21f..d182b164 100644
+--- a/packages/ui/types/control.ts
++++ b/packages/ui/types/control.ts
+@@ -39,7 +39,7 @@ export interface ProfileMeta {
+   // undefined => auto-update off). SHARED CONTRACTS.
+   updateInterval?: number
+   baseProfileId?: string
+-  managedBy?: 'visual-editor'
++  managedBy?: 'visual-editor' | 'router'
+   editorStatus?: 'clean' | 'conflicted'
+   updatedAt: number
+   subscriptionInfo?: ProfileSubscriptionInfo
+@@ -62,6 +62,7 @@ export type ControlFeature =
+   | 'config-sections'
+   | 'visual-config-editor'
+   | 'tun'
++  | 'router-mode'
+ 
+ export interface ProfileEditorSnapshot {
+   profile: ProfileMeta

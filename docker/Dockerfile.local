@@ -12,6 +12,9 @@ ARG NODE_VERSION=22
 ARG GO_VERSION=1.26
 # Override for a Docker Hub mirror, e.g. docker.m.daocloud.io.
 ARG BASE_REGISTRY=docker.io
+# Optional Alpine package mirror for slow/blocked dl-cdn.alpinelinux.org, e.g.
+# https://mirrors.aliyun.com/alpine or https://mirrors.tuna.tsinghua.edu.cn/alpine
+ARG APK_MIRROR=
 
 # ---- Stage 1: build the mihomo kernel from the local submodule ----
 # Build tools run on the builder platform; Go cross-compiles to TARGETARCH.
@@ -46,6 +49,7 @@ RUN set -eux; \
 FROM --platform=$BUILDPLATFORM ${BASE_REGISTRY}/library/node:${NODE_VERSION}-alpine AS builder
 
 ARG NPM_REGISTRY=https://registry.npmjs.org/
+ARG APK_MIRROR=
 # Skip the remote Google Fonts metadata fetch for offline/local builds.
 ARG NUXT_FONTS_DISABLE_REMOTE=true
 
@@ -67,6 +71,17 @@ COPY metacubexd/packages/ packages/
 COPY metacubexd/apps/ apps/
 COPY docker/patch-offline-fonts.mjs /tmp/patch-offline-fonts.mjs
 COPY docker/patch-aio-config.mjs /tmp/patch-aio-config.mjs
+COPY docker/router-mode.patch /tmp/router-mode.patch
+
+# Router mode is carried as a patch against the pinned metacubexd submodule so
+# the root repository stays the single deployment source (the submodule still
+# tracks upstream). Alpine's busybox has no patch applet.
+RUN if [ -n "$APK_MIRROR" ]; then \
+      sed -i "s#https://dl-cdn.alpinelinux.org#${APK_MIRROR}#g" /etc/apk/repositories; \
+    fi \
+    && apk add --no-cache patch \
+    && cd /repo \
+    && patch -p1 < /tmp/router-mode.patch
 
 RUN if [ "$NUXT_FONTS_DISABLE_REMOTE" = "true" ]; then \
       node /tmp/patch-offline-fonts.mjs; \
@@ -86,11 +101,15 @@ RUN pnpm --filter @metacubexd/server... build
 FROM ${BASE_REGISTRY}/library/node:${NODE_VERSION}-alpine AS runtime
 
 ARG METACUBEXD_VERSION=dev
+ARG APK_MIRROR=
 
 LABEL org.opencontainers.image.title="MetaCubeXD All-in-One Server (local source build)"
 LABEL org.opencontainers.image.version="${METACUBEXD_VERSION}"
 
-RUN apk add --no-cache ca-certificates tzdata tini wget
+RUN if [ -n "$APK_MIRROR" ]; then \
+      sed -i "s#https://dl-cdn.alpinelinux.org#${APK_MIRROR}#g" /etc/apk/repositories; \
+    fi \
+    && apk add --no-cache ca-certificates tzdata tini wget
 
 WORKDIR /app
 
