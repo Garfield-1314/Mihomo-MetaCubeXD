@@ -60,3 +60,59 @@ replaceOnce(
   "      formData.url = defaultBackendURL.value\n      formData.secret = ''",
   '      formData.url = defaultBackendURL.value\n      formData.secret = defaultBackendSecret.value',
 )
+
+// ---- AIO kernel geodata -------------------------------------------------
+// The default MetaCubeX release URLs live on GitHub, which is slow/blocked on
+// some LANs. Pin the runtime geox URLs to jsDelivr and force dat mode so the
+// common GEOIP/GEOSITE rules validate without an MMDB download.
+const supervisor = 'packages/agent/src/supervisor.ts'
+
+replaceOnce(
+  supervisor,
+  "const managedKeys = new Set(['external-controller', 'secret', 'mixed-port'])",
+  "const managedKeys = new Set(['external-controller', 'secret', 'mixed-port', 'geodata-mode'])",
+)
+
+replaceOnce(
+  supervisor,
+  `    const header = [
+      \`external-controller: \${state.externalController}\`,
+      \`secret: \${state.secret}\`,
+      ...(mixedPort != null ? [\`mixed-port: \${mixedPort}\`] : []),
+      '',
+    ].join('\\n')`,
+  `    const header = [
+      \`external-controller: \${state.externalController}\`,
+      \`secret: \${state.secret}\`,
+      ...(mixedPort != null ? [\`mixed-port: \${mixedPort}\`] : []),
+      'geodata-mode: true',
+      'geox-url:',
+      '  geoip: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat',
+      '  geosite: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat',
+      '  mmdb: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb',
+      '',
+    ].join('\\n')`,
+)
+
+replaceOnce(
+  supervisor,
+  `    const kept = existing
+      .split('\\n')
+      .filter((line) => !shouldStripTopLevelKey(line))
+      .join('\\n')`,
+  `    let skippingGeox = false
+    const kept = existing
+      .split('\\n')
+      .filter((line) => {
+        if (skippingGeox) {
+          if (line.trim() === '' || /^\\s/.test(line)) return false
+          skippingGeox = false
+        }
+        if (/^geox-url\\s*:/.test(line)) {
+          skippingGeox = true
+          return false
+        }
+        return !shouldStripTopLevelKey(line)
+      })
+      .join('\\n')`,
+)

@@ -456,6 +456,26 @@ docker logs --tail=200 metacubexd
 curl -fsS http://127.0.0.1:8080/api/control/health
 ```
 
+### 激活后代理列表为空
+
+先检查内核是否真的加载了订阅：
+
+```bash
+sudo docker exec metacubexd /usr/local/bin/mihomo -t -f /data/active.yaml
+```
+
+如果日志出现 `can't download MMDB` 或 `can't download GeoIP.dat`，说明 GeoIP/GeoSite
+数据下载失败。新 AIO 镜像会注入：
+
+```yaml
+geodata-mode: true
+geox-url:
+  geoip: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat
+  geosite: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat
+```
+
+如果仍然为空，在控制中心点“重启内核”，然后刷新代理页面。
+
 ### TUN 不工作
 
 确认：
