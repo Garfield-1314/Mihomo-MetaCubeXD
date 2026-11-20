@@ -1299,7 +1299,7 @@ fi
 # ---------------------------------------------------------------------------
 
 schedule_cleanup() {
-  local script_dir bundle_dir="" parent="" outer_tgz="" outer_sha="" archive=""
+  local script_dir bundle_dir="" parent="" outer_tgz="" outer_sha=""
   local -a targets=()
   local cleanup_cmd t
 
