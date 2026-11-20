@@ -56,6 +56,13 @@ jobs:
             (cd "$dir" && sha256sum -c SHA256SUMS)
           done
 
+      - name: Ensure no outer sha256 assets
+        run: |
+          if compgen -G "dist/*.sha256" >/dev/null; then
+            echo "outer .sha256 assets are no longer published" >&2
+            exit 1
+          fi
+
       - name: Publish release assets
         uses: softprops/action-gh-release@v3
         with:

@@ -343,6 +343,27 @@ if [[ -z "$DATA_VOLUME" ]]; then
 fi
 echo "Data volume: $DATA_VOLUME"
 
+# Verify the bundle's internal checksums before touching the current image or
+# the deployed configuration. The release bundle contains SHA256SUMS for the
+# installer, image archive and README; a mismatch must abort before docker load.
+if [[ -n "$ARCHIVE_FILE" ]]; then
+  [[ -f "$ARCHIVE_FILE" ]] || die "archive not found: $ARCHIVE_FILE"
+
+  ARCHIVE_DIR=$(cd "$(dirname "$ARCHIVE_FILE")" && pwd)
+  ARCHIVE_NAME=$(basename "$ARCHIVE_FILE")
+  if [[ -f "$ARCHIVE_DIR/SHA256SUMS" ]] &&
+    awk -v f="$ARCHIVE_NAME" '$2 == f { found=1 } END { exit(found ? 0 : 1) }' \
+      "$ARCHIVE_DIR/SHA256SUMS"; then
+    command -v sha256sum >/dev/null 2>&1 ||
+      die "sha256sum is required to verify $ARCHIVE_DIR/SHA256SUMS"
+    echo "Verifying bundle checksums..."
+    (cd "$ARCHIVE_DIR" && sha256sum -c SHA256SUMS) ||
+      die "bundle checksum verification failed; re-download the bundle"
+  else
+    echo "SHA256SUMS not found for $ARCHIVE_NAME; skipping bundle verification."
+  fi
+fi
+
 # Keep the currently deployed image available for rollback. This is especially
 # important for archive upgrades: the new archive is loaded under the same tag.
 if [[ -n "$ARCHIVE_FILE" || "$BUILD_LOCAL" == 1 ]] &&
