@@ -296,7 +296,7 @@ dist/metacubexd-pi-<metacubexd>-<mihomo>/
 └── SHA256SUMS
 ```
 
-以及同名的外层 `.tar.gz` 和 `.sha256` 文件。
+以及同名的外层 `.tar.gz` 文件。
 
 脚本会校验：
 
@@ -576,7 +576,6 @@ CI 产物：
 ```text
 metacubexd-pi-<github-sha>-<run_attempt>/
   metacubexd-pi-1.275.2-v1.19.27.tar.gz
-  metacubexd-pi-1.275.2-v1.19.27.tar.gz.sha256
 ```
 
 发布示例：

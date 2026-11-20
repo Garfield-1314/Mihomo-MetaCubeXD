@@ -247,10 +247,6 @@ chmod 0644 "$BUNDLE_DIR/SHA256SUMS"
 if [[ "$MAKE_TAR" == 1 ]]; then
   echo "Creating $OUTPUT_DIR/$BUNDLE_NAME.tar.gz..."
   tar -C "$OUTPUT_DIR" -czf "$OUTPUT_DIR/$BUNDLE_NAME.tar.gz" "$BUNDLE_NAME"
-  (
-    cd "$OUTPUT_DIR"
-    sha256sum "$BUNDLE_NAME.tar.gz" >"$BUNDLE_NAME.tar.gz.sha256"
-  )
 fi
 
 echo

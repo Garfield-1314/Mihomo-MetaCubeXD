@@ -1293,6 +1293,7 @@ schedule_cleanup() {
     bundle_dir=$script_dir
     parent=$(dirname "$bundle_dir")
     outer_tgz="$parent/$(basename "$bundle_dir").tar.gz"
+    # Legacy release asset: remove it when upgrading from an older bundle.
     outer_sha="${outer_tgz}.sha256"
   fi
 

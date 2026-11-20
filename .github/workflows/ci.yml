@@ -97,12 +97,9 @@ jobs:
       - name: Smoke test arm64 image
         run: bash scripts/smoke-test-image.sh --platform linux/arm64 metacubexd-server:pi
 
-      - name: Verify bundle checksums
+      - name: Verify bundled checksums
         run: |
           cd dist
-          for sum in *.sha256; do
-            sha256sum -c "$sum"
-          done
           for dir in metacubexd-pi-*/; do
             (cd "$dir" && sha256sum -c SHA256SUMS)
           done
@@ -111,8 +108,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: metacubexd-pi-${{ github.sha }}-${{ github.run_attempt }}
-          path: |
-            dist/*.tar.gz
-            dist/*.sha256
+          path: dist/*.tar.gz
           if-no-files-found: error
           retention-days: 14

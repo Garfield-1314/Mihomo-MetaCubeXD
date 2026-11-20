@@ -49,12 +49,9 @@ jobs:
       - name: Smoke test arm64 image
         run: bash scripts/smoke-test-image.sh --platform linux/arm64 metacubexd-server:pi
 
-      - name: Verify bundle checksums
+      - name: Verify bundled checksums
         run: |
           cd dist
-          for sum in *.sha256; do
-            sha256sum -c "$sum"
-          done
           for dir in metacubexd-pi-*/; do
             (cd "$dir" && sha256sum -c SHA256SUMS)
           done
@@ -66,6 +63,4 @@ jobs:
           name: MetaCubeXD Pi ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: |
-            dist/*.tar.gz
-            dist/*.sha256
+          files: dist/*.tar.gz
