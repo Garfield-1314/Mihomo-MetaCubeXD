@@ -5,6 +5,8 @@
 在 Debian/Ubuntu 上部署 MetaCubeXD 一体化服务（Dashboard + Control Agent + mihomo 内核），
 默认使用本仓库中的本地源码构建镜像，而不是拉取 GHCR 上的 `latest` 镜像。
 
+变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 部署只需要一个订阅
 
 全新部署的验收标准只有一条：
