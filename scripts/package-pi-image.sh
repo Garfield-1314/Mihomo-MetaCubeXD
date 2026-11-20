@@ -219,14 +219,20 @@ sudo bash install-mihomo-bypass-router.sh \\
   --lan-cidr 192.168.5.0/24
 \`\`\`
 
-Then open \`http://<LAN_IP>:8080\`, import the subscription, and activate the
-generated \`/opt/metacubexd/merge-profile.yaml\` Merge Profile.
+Then open \`http://<LAN_IP>:8080\`, import ONE subscription URL, and wait for
+the managed AIO Router profile to activate.
 
 ## Notes
 
 - Do not use this image on a 32-bit (\`armv7l\`) system.
 - WSL test mode is not used here; this bundle is for the Pi.
 - The installer enables IPv4 forwarding and checks \`/dev/net/tun\`.
+- The installer installs \`metacubexd-host-dns.timer\`, which points the Pi's
+  own resolver at \`<LAN_IP>:53\` once mihomo is healthy. Add \`--no-host-dns\`
+  to keep the host resolver untouched.
+- When run from this bundle after a successful install, the installer removes
+  the image archive, the outer bundle and itself. Add \`--no-cleanup\` to keep
+  them for debugging.
 - Keep 8080/9090/7890 on the trusted LAN; the dashboard has no login.
 EOF
 chmod 0644 "$BUNDLE_DIR/README-pi.md"

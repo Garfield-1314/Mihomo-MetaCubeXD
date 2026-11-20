@@ -388,14 +388,41 @@ ip route show table 2022
 
 正常情况下会看到 `Meta` 接口、`9000/9001/9002` 规则和 `table 2022` 的默认路由。
 
-### 4. 无人值守
+### 4. 宿主机 DNS
+
+非 WSL 的路由器模式会额外安装：
+
+```text
+metacubexd-host-dns.service
+metacubexd-host-dns.timer
+```
+
+容器健康时，timer 会把树莓派**本机**的上游 DNS 指向 `<LAN_IP>:53`，并每分钟重新确认一次；mihomo 不健康时回退到主路由网关，避免宿主机完全无法解析。这样树莓派本机执行 `ping`、`curl`、`apt` 时也会使用 mihomo 的 fake-ip，而不是主路由返回的污染结果。
+
+检查：
+
+```bash
+systemctl status metacubexd-host-dns.timer
+resolvectl status | sed -n '1,60p'
+resolvectl query www.google.com
+# 应返回 198.18.x.x
+```
+
+`--no-host-dns` 可以关闭自动管理；设置会写入 `/opt/metacubexd/.env` 的 `HOST_DNS`，升级时保留。
+
+注意：`--set-ip --dns` 仍然决定开机时 netplan/NetworkManager 里的静态 DNS，建议保留主路由作为兜底；host DNS timer 会在 mihomo 健康后覆盖运行时 DNS。若希望静态配置也直接指向 mihomo，可显式传 `--dns <LAN_IP>`。
+
+`--archive` 且从交付包目录运行时，安装成功并通过 host DNS 验证后会自动删除镜像包、外层 bundle 和安装脚本；加 `--no-cleanup` 可以保留现场。
+
+### 5. 无人值守
 
 安装脚本会启用：
 
 ```text
-metacubexd-forward.timer   每分钟补一次 TUN 转发规则
-metacubexd-health.timer    每分钟检查控制面和内核状态
-metacubexd-backup.timer    每天 03:30 备份 .env 和数据卷
+metacubexd-forward.timer     每分钟补一次 TUN 转发规则
+metacubexd-health.timer      每分钟检查控制面和内核状态
+metacubexd-backup.timer      每天 03:30 备份 .env 和数据卷
+metacubexd-host-dns.timer    每分钟确认宿主机 DNS 指向 mihomo
 ```
 
 Docker 日志限制为 `10 MB × 3`，不会长期写满 SD 卡。镜像升级仍然手动触发，

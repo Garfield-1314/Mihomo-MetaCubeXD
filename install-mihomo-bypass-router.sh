@@ -15,12 +15,14 @@ set -Eeuo pipefail
 # but deliberately does not attach TUN or change host routing.
 
 REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
 APP_DIR=${APP_DIR:-/opt/metacubexd}
 IMAGE_TAG=${IMAGE_TAG:-metacubexd-server:local}
 MIHOMO_TAG=${MIHOMO_TAG:-v1.19.27}
 TARGET_PLATFORM=${TARGET_PLATFORM:-}
 LAN_IP=${LAN_IP:-}
 LAN_CIDR=${LAN_CIDR:-}
+LAN_IFACE=${LAN_IFACE:-}
 DATA_VOLUME=${DATA_VOLUME:-}
 NET_IFACE=${NET_IFACE:-}
 NET_GATEWAY=${NET_GATEWAY:-}
@@ -33,6 +35,16 @@ GO_VERSION=${GO_VERSION:-1.26}
 # TUN + DNS + forwarding configured automatically. WSL is test-only.
 TUN_STACK=${TUN_STACK:-gvisor}
 ROUTER_MODE=${ROUTER_MODE:-1}
+# Point the host's own resolver at mihomo once the container is healthy. This
+# keeps host tools (ping/curl/apt) from using the polluted main-router DNS.
+if [[ -n "${HOST_DNS:-}" ]]; then
+  HOST_DNS_SET=1
+else
+  HOST_DNS=1
+  HOST_DNS_SET=0
+fi
+CLEANUP=${CLEANUP:-1}
+HOST_DNS_OK=1
 
 BUILD_LOCAL=1
 NO_BUILD=0
@@ -78,14 +90,17 @@ Options:
   --interface IFACE     Interface for --set-ip (default: auto-detect)
   --gateway IP          Gateway for --set-ip (default: current default route)
   --dns IP              DNS server for --set-ip (default: gateway)
+  --host-dns            Point the host resolver at mihomo (default in router mode)
+  --no-host-dns         Leave the host resolver untouched
+  --no-cleanup          Keep the image archive and installer after a successful install
   --disable-wifi        Disable Wi-Fi persistently when --set-ip is used
   --reboot              Reboot after writing the static-IP config
   --help                Show this help
 
 Environment:
-  APP_DIR, IMAGE_TAG, MIHOMO_TAG, TARGET_PLATFORM, LAN_IP, LAN_CIDR,
+  APP_DIR, IMAGE_TAG, MIHOMO_TAG, TARGET_PLATFORM, LAN_IP, LAN_CIDR, LAN_IFACE,
   DATA_VOLUME, NET_IFACE, NET_GATEWAY, NET_DNS, TZ, NODE_VERSION, GO_VERSION,
-  ROUTER_MODE, TUN_STACK
+  ROUTER_MODE, TUN_STACK, HOST_DNS, CLEANUP
 EOF
 }
 
@@ -164,6 +179,20 @@ while [[ $# -gt 0 ]]; do
       NET_DNS=$2
       shift 2
       ;;
+    --host-dns)
+      HOST_DNS=1
+      HOST_DNS_SET=1
+      shift
+      ;;
+    --no-host-dns)
+      HOST_DNS=0
+      HOST_DNS_SET=1
+      shift
+      ;;
+    --no-cleanup)
+      CLEANUP=0
+      shift
+      ;;
     --disable-wifi)
       DISABLE_WIFI=1
       shift
@@ -181,6 +210,20 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+case "$HOST_DNS" in
+  0|1) ;;
+  *) HOST_DNS=1 ;;
+esac
+case "$CLEANUP" in
+  0|1) ;;
+  *) CLEANUP=1 ;;
+esac
+
+# Resolve the archive path before the script changes directory to APP_DIR.
+if [[ -n "$ARCHIVE_FILE" && -f "$ARCHIVE_FILE" ]]; then
+  ARCHIVE_FILE=$(cd "$(dirname "$ARCHIVE_FILE")" && pwd)/$(basename "$ARCHIVE_FILE")
+fi
 
 if [[ ${EUID} -ne 0 ]]; then
   die "run as root: sudo bash $0"
@@ -216,19 +259,51 @@ if grep -qiE '(microsoft|wsl)' /proc/sys/kernel/osrelease 2>/dev/null; then
   IS_WSL=true
 fi
 
+if [[ "$IS_WSL" == true ]]; then
+  HOST_DNS=0
+  CLEANUP=0
+fi
+
 if [[ "$SET_IP" == 1 && "$IS_WSL" == true ]]; then
   die "--set-ip is not supported in WSL test mode"
 fi
 
-apt-get update
-PACKAGES=(ca-certificates curl openssl git iproute2 iptables gzip)
-if [[ "$DISABLE_WIFI" == 1 ]]; then
-  PACKAGES+=(rfkill)
+# Upgrades normally already have every runtime dependency. Only touch apt when
+# something is actually missing: some Pi images point at an unreleased Ubuntu
+# suite, and a failing apt-get update must not block an otherwise valid upgrade.
+need_packages=0
+for cmd in curl openssl git ip iptables gzip; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Missing command: $cmd"
+    need_packages=1
+  fi
+done
+if [[ "$DISABLE_WIFI" == 1 ]] && ! command -v rfkill >/dev/null 2>&1; then
+  echo "Missing command: rfkill"
+  need_packages=1
+fi
+if [[ ! -f /etc/ssl/certs/ca-certificates.crt ]]; then
+  echo "Missing CA certificate bundle"
+  need_packages=1
 fi
 if ! command -v docker >/dev/null 2>&1; then
-  PACKAGES+=(docker.io)
+  echo "Missing command: docker"
+  need_packages=1
 fi
-DEBIAN_FRONTEND=noninteractive apt-get install -y "${PACKAGES[@]}"
+
+if [[ "$need_packages" == 1 ]]; then
+  apt-get update
+  PACKAGES=(ca-certificates curl openssl git iproute2 iptables gzip)
+  if [[ "$DISABLE_WIFI" == 1 ]]; then
+    PACKAGES+=(rfkill)
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    PACKAGES+=(docker.io)
+  fi
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${PACKAGES[@]}"
+else
+  echo "System packages already present; skipping apt-get."
+fi
 
 # Compose v2 is preferred when available, but some Raspberry Pi OS images do
 # not ship docker-compose-v2. The start section falls back to docker run.
@@ -348,6 +423,11 @@ ip_for_cidr() {
     awk -v cidr="$1" '$4 == cidr { split($4, a, "/"); print a[1]; exit }'
 }
 
+iface_for_ip() {
+  ip -4 -o addr show scope global 2>/dev/null |
+    awk -v ip="$1" '$4 ~ "^" ip "/" { print $2; exit }'
+}
+
 detect_lan_pair() {
   local def_if candidates="" best score iface cidr count
 
@@ -382,6 +462,7 @@ detect_lan_pair() {
   read -r score iface cidr <<<"$best"
   LAN_IP=${cidr%/*}
   LAN_CIDR=$cidr
+  LAN_IFACE=$iface
 
   count=$(printf '%s' "$candidates" | grep -c . || true)
   if [[ "$count" -gt 1 ]]; then
@@ -425,6 +506,15 @@ EOF
       sysctl -w net.ipv4.ip_forward=1 >/dev/null
     fi
   fi
+
+  LAN_IFACE=${LAN_IFACE:-${NET_IFACE:-$(iface_for_ip "$LAN_IP")}}
+  LAN_IFACE=${LAN_IFACE:-$(ip -4 route show default 2>/dev/null | awk '{ print $5; exit }')}
+  if [[ -z "$LAN_IFACE" ]]; then
+    warn "could not determine the LAN interface; host DNS management will be skipped"
+  fi
+  if [[ -z "$NET_GATEWAY" ]]; then
+    NET_GATEWAY=$(ip -4 route show default 2>/dev/null | awk '{ print $3; exit }')
+  fi
 fi
 
 DEFAULT_BACKEND_URL="http://${LAN_IP}:9090"
@@ -444,6 +534,18 @@ read_env_value() {
   sed -n "s/^${key}=//p" "$APP_DIR/.env" | tail -n1
 }
 
+if [[ "$HOST_DNS_SET" == 0 ]]; then
+  HOST_DNS=$(read_env_value HOST_DNS)
+  HOST_DNS=${HOST_DNS:-1}
+fi
+if [[ "$IS_WSL" == true ]]; then
+  HOST_DNS=0
+fi
+case "$HOST_DNS" in
+  0|1) ;;
+  *) HOST_DNS=1 ;;
+esac
+
 CONTROL_TOKEN=${CONTROL_TOKEN:-$(read_env_value CONTROL_TOKEN)}
 CLASH_SECRET=${CLASH_SECRET:-$(read_env_value CLASH_SECRET)}
 TZ=${TZ:-$(read_env_value TZ)}
@@ -458,9 +560,11 @@ DEFAULT_BACKEND_URL=$DEFAULT_BACKEND_URL
 IMAGE_TAG=$IMAGE_TAG
 LAN_IP=$LAN_IP
 LAN_CIDR=$LAN_CIDR
+LAN_IFACE=$LAN_IFACE
 DATA_VOLUME=$DATA_VOLUME
 ROUTER_MODE=$ROUTER_MODE
 TUN_STACK=$TUN_STACK
+HOST_DNS=$HOST_DNS
 TZ=$TZ
 EOF
 chmod 0600 "$APP_DIR/.env"
@@ -873,9 +977,12 @@ fi
 
 install_router_units() {
   local iface
-  iface=${NET_IFACE:-$(ip -4 route show default 2>/dev/null | awk '{ print $5; exit }')}
+  iface=${LAN_IFACE:-${NET_IFACE:-$(ip -4 route show default 2>/dev/null | awk '{ print $5; exit }')}}
   if [[ -z "$iface" ]]; then
     warn "could not determine the LAN interface; skipping forwarding service"
+    if [[ "$HOST_DNS" == 1 ]]; then
+      HOST_DNS_OK=0
+    fi
     return 0
   fi
 
@@ -883,6 +990,9 @@ install_router_units() {
   cat > /etc/default/metacubexd-router <<EOF
 # Managed by the MetaCubeXD installer.
 ROUTER_IFACE=$iface
+LAN_IFACE=$iface
+LAN_IP=$LAN_IP
+NET_GATEWAY=$NET_GATEWAY
 APP_DIR=$APP_DIR
 EOF
   chmod 0644 /etc/default/metacubexd-router
@@ -1058,16 +1168,165 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+  if [[ "$HOST_DNS" == 1 && "$ROUTER_MODE" == 1 ]]; then
+    cat > /usr/local/sbin/metacubexd-host-dns.sh <<'EOF'
+#!/bin/sh
+set -u
+. /etc/default/metacubexd-router
+IFACE=${LAN_IFACE:-${ROUTER_IFACE:-}}
+LAN_IP=${LAN_IP:-}
+GATEWAY=${NET_GATEWAY:-}
+[ -n "$IFACE" ] || exit 0
+[ -n "$LAN_IP" ] || exit 0
+command -v resolvectl >/dev/null 2>&1 || exit 0
+systemctl is-active --quiet systemd-resolved || exit 0
+
+healthy=0
+for _ in $(seq 1 30); do
+  if curl -fsS --max-time 1 http://127.0.0.1:8080/api/control/health >/dev/null 2>&1; then
+    healthy=1
+    break
+  fi
+  sleep 2
+done
+
+if [ "$healthy" = 1 ]; then
+  target=$LAN_IP
+elif [ -n "$GATEWAY" ]; then
+  target=$GATEWAY
+else
+  exit 0
+fi
+
+current=$(resolvectl dns "$IFACE" 2>/dev/null | awk '{print $NF}' | tail -n1)
+if [ "$current" != "$target" ]; then
+  resolvectl dns "$IFACE" "$target" >/dev/null 2>&1 || true
+  resolvectl domain "$IFACE" '~.' >/dev/null 2>&1 || true
+  resolvectl flush-caches >/dev/null 2>&1 || true
+  logger -t metacubexd-host-dns "host DNS -> $target via $IFACE"
+fi
+EOF
+    chmod 0755 /usr/local/sbin/metacubexd-host-dns.sh
+
+    cat > /etc/systemd/system/metacubexd-host-dns.service <<'EOF'
+[Unit]
+Description=Point host DNS at the MetaCubeXD mihomo resolver
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/metacubexd-host-dns.sh
+EOF
+
+    cat > /etc/systemd/system/metacubexd-host-dns.timer <<'EOF'
+[Unit]
+Description=Re-assert host DNS for MetaCubeXD
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  else
+    systemctl disable --now metacubexd-host-dns.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/metacubexd-host-dns.service \
+      /etc/systemd/system/metacubexd-host-dns.timer \
+      /usr/local/sbin/metacubexd-host-dns.sh
+  fi
+
   systemctl daemon-reload
   systemctl enable --now metacubexd-forward.timer || warn "could not enable forwarding timer"
   systemctl enable --now metacubexd-health.timer || warn "could not enable health timer"
   systemctl enable --now metacubexd-backup.timer || warn "could not enable backup timer"
-  echo "Router support: forwarding, health checks, daily backups"
+
+  if [[ "$HOST_DNS" == 1 && "$ROUTER_MODE" == 1 ]]; then
+    systemctl enable --now metacubexd-host-dns.timer || warn "could not enable host DNS timer"
+    systemctl start metacubexd-host-dns.service || warn "could not start host DNS service"
+    if command -v resolvectl >/dev/null 2>&1; then
+      if resolvectl query www.google.com 2>/dev/null | grep -q '198\.18\.'; then
+        echo "Host DNS: mihomo (verified)"
+      else
+        warn "host DNS did not return a fake-ip; keeping the installer package for troubleshooting"
+        HOST_DNS_OK=0
+      fi
+    else
+      warn "resolvectl not found; host DNS management is unavailable"
+      HOST_DNS_OK=0
+    fi
+  fi
+
+  echo "Router support: forwarding, health checks, daily backups, host DNS"
 }
 
 if [[ "$IS_WSL" != true ]]; then
   install_router_units
 fi
+
+# ---------------------------------------------------------------------------
+# Installer package cleanup
+#
+# Bundle mode keeps the archive, checksum and installer next to each other.
+# After a successful install (health + host DNS verified), remove the bundle
+# directory and the outer archive. The cleanup runs from a detached process so
+# it never deletes the installer while bash is still reading it. The source
+# checkout is protected by the bundle marker and .git checks below.
+# ---------------------------------------------------------------------------
+
+schedule_cleanup() {
+  local script_dir bundle_dir="" parent="" outer_tgz="" outer_sha="" archive=""
+  local -a targets=()
+  local cleanup_cmd t
+
+  script_dir=$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd) || return 0
+
+  if [[ -f "$script_dir/SHA256SUMS" &&
+    -f "$script_dir/README-pi.md" &&
+    -f "$script_dir/metacubexd-server-pi.tar.gz" ]] &&
+    [[ "$(basename "$script_dir")" == metacubexd-pi-* ]] &&
+    [[ ! -d "$script_dir/.git" ]] &&
+    [[ "$script_dir" != "$HOME" && "$script_dir" != "/" && "$script_dir" != "/opt" ]]; then
+    bundle_dir=$script_dir
+    parent=$(dirname "$bundle_dir")
+    outer_tgz="$parent/$(basename "$bundle_dir").tar.gz"
+    outer_sha="${outer_tgz}.sha256"
+  fi
+
+  if [[ -n "$bundle_dir" ]]; then
+    targets+=("$bundle_dir")
+    [[ -f "$outer_tgz" ]] && targets+=("$outer_tgz")
+    [[ -f "$outer_sha" ]] && targets+=("$outer_sha")
+  elif [[ -n "$ARCHIVE_FILE" && -f "$ARCHIVE_FILE" ]]; then
+    targets+=("$ARCHIVE_FILE")
+  fi
+
+  [[ ${#targets[@]} -gt 0 ]] || return 0
+
+  cleanup_cmd="sleep 5; rm -rf --"
+  for t in "${targets[@]}"; do
+    cleanup_cmd+=" $(printf '%q' "$t")"
+  done
+  if [[ -n "$parent" && "$parent" != "$HOME" && "$parent" != "/" ]]; then
+    cleanup_cmd+="; rmdir --ignore-fail-on-non-empty -- $(printf '%q' "$parent") 2>/dev/null || true"
+  fi
+
+  echo "Cleanup scheduled:"
+  for t in "${targets[@]}"; do
+    echo "  $t"
+  done
+
+  if command -v systemd-run >/dev/null 2>&1 &&
+    systemd-run --quiet --collect --on-active=5s \
+      --unit="metacubexd-cleanup-$$" /bin/sh -c "$cleanup_cmd"; then
+    :
+  else
+    nohup /bin/sh -c "$cleanup_cmd" >/dev/null 2>&1 &
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # WSL-only CORS helper. Real router deployments get CORS, TUN and DNS from the
@@ -1129,6 +1388,16 @@ if [[ "$COMPOSE_MODE" == 1 ]]; then
   echo "Container logs: cd $APP_DIR && docker compose logs -f"
 else
   echo "Container logs: docker logs -f metacubexd"
+fi
+
+if [[ "$CLEANUP" == 1 && "$IS_WSL" != true ]]; then
+  if [[ "$HOST_DNS_OK" != 1 ]]; then
+    warn "cleanup skipped because host DNS verification failed; remove the bundle manually after fixing it"
+  elif [[ "$REBOOT_AFTER" == 1 ]]; then
+    warn "cleanup skipped because --reboot was requested; remove the bundle manually after the reboot"
+  else
+    schedule_cleanup
+  fi
 fi
 
 if [[ "$SET_IP" == 1 ]]; then
