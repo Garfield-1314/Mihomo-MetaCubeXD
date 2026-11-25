@@ -72,6 +72,7 @@ MIN_PROVIDER_RATIO=${AB_MIN_PROVIDER_RATIO:-80}
 ARCHIVE=""
 IMAGE_INPUT=""
 TARGET_SLOT=""
+CHILD_ARGS=()
 SELF_TEST_ONLY=0
 RECOVER=0
 DETACH=1
@@ -201,6 +202,17 @@ parse_args() {
       [[ -f "$ARCHIVE" ]] || die "archive not found: $ARCHIVE"
       ARCHIVE=$(readlink -f "$ARCHIVE")
     fi
+    # systemd-run starts the child in /, so rebuild the arguments from the
+    # resolved values instead of forwarding a possibly relative archive path.
+    CHILD_ARGS=()
+    if [[ -n "$ARCHIVE" ]]; then
+      CHILD_ARGS+=(--archive "$ARCHIVE")
+    else
+      CHILD_ARGS+=(--image "$IMAGE_INPUT")
+    fi
+    [[ -n "$TARGET_SLOT" ]] && CHILD_ARGS+=(--slot "$TARGET_SLOT")
+    [[ "$NO_DATA_RESTORE" == 1 ]] && CHILD_ARGS+=(--no-data-restore)
+    CHILD_ARGS+=(--no-detach)
   fi
 }
 
@@ -237,7 +249,7 @@ detach_if_requested() {
     --setenv=AB_DIR="$AB_DIR" \
     --setenv=BACKUP_DIR="$BACKUP_DIR" \
     --setenv=CONTAINER_NAME="$CONTAINER_NAME" \
-    /bin/bash "$SCRIPT_PATH" --no-detach "$@" >/dev/null; then
+    /bin/bash "$SCRIPT_PATH" "${CHILD_ARGS[@]}" >/dev/null; then
     die "failed to start systemd unit $unit; check journalctl -u $unit"
   fi
   log "upgrade started; monitor with: journalctl -u $unit -f"
@@ -1145,7 +1157,7 @@ main() {
   require_commands
 
   if [[ "$SELF_TEST_ONLY" == 0 && "$RECOVER" == 0 && "$DETACH" == 1 && "$NO_DETACH" == 0 ]]; then
-    detach_if_requested "$@"
+    detach_if_requested
   fi
 
   load_env
