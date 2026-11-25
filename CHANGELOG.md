@@ -11,6 +11,14 @@
   - 不再用较旧的 profile 副本覆盖内核已更新的 provider 缓存，避免节点回退和重置 24 小时刷新计时。
   - 无法解析的订阅内容保留上一次可用节点，不触发无意义的内核重启。
 
+### 新增
+
+- A/B 镜像升级：`aio-ab-upgrade.sh` + `metacubexd-upgrade-recover.service`。
+  - 新镜像先进备用槽位，`mihomo -t` 和独立控制面预检通过后才切换。
+  - 切换后 host 侧自检 90 秒：控制面、内核 PID、TUN、ip rule/table、DNS、代理、独立 netns 客户端、provider 数量、关键日志。
+  - 连续失败或掉电重启时自动回滚到旧槽位和备份数据。
+  - 升级脚本可 `--detach` 交给 systemd-run，SSH 断开不会中断升级。
+
 ## v1.275.2-mihomo-v1.19.27-r2（2026-11-20）
 
 ### 新增
