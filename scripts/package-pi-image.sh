@@ -185,6 +185,8 @@ docker save "$IMAGE_TAG" | gzip >"$IMAGE_FILE"
 
 cp "$REPO_DIR/install-mihomo-bypass-router.sh" "$BUNDLE_DIR/"
 chmod 0755 "$BUNDLE_DIR/install-mihomo-bypass-router.sh"
+cp "$REPO_DIR/scripts/aio-ab-upgrade.sh" "$BUNDLE_DIR/"
+chmod 0755 "$BUNDLE_DIR/aio-ab-upgrade.sh"
 
 cat >"$BUNDLE_DIR/README-pi.md" <<EOF
 # MetaCubeXD Raspberry Pi bundle
@@ -193,6 +195,7 @@ cat >"$BUNDLE_DIR/README-pi.md" <<EOF
 - mihomo: ${MIHOMO_TAG}
 - Image: \`${IMAGE_TAG}\` (linux/arm64)
 - Installer: \`install-mihomo-bypass-router.sh\`
+- A/B upgrade helper: \`aio-ab-upgrade.sh\`
 
 ## Requirements
 
@@ -222,6 +225,30 @@ sudo bash install-mihomo-bypass-router.sh \\
 Then open \`http://<LAN_IP>:8080\`, import ONE subscription URL, and wait for
 the managed AIO Router profile to activate.
 
+## A/B upgrade (recommended)
+
+Load the new image and run the host-side A/B upgrade. It stages the image in
+the inactive slot, prechecks it, switches, runs a 90-second host-side self-test,
+and automatically rolls back to the previous slot on failure.
+
+\`\`\`bash
+sudo bash aio-ab-upgrade.sh \\
+  --archive metacubexd-server-pi.tar.gz --detach
+sudo journalctl -u metacubexd-ab-upgrade -f
+\`\`\`
+
+Check the current slot and upgrade history:
+
+\`\`\`bash
+cat /opt/metacubexd/ab/active-slot
+ls -l /opt/metacubexd/ab/history
+\`\`\`
+
+If the host reboots during an upgrade, \`metacubexd-upgrade-recover.service\`
+detects the in-progress marker and restores the previous slot automatically.
+
+Use \`--self-test-only\` to validate the current deployment without switching.
+
 ## Notes
 
 - Do not use this image on a 32-bit (\`armv7l\`) system.
@@ -239,7 +266,7 @@ chmod 0644 "$BUNDLE_DIR/README-pi.md"
 
 (
   cd "$BUNDLE_DIR"
-  sha256sum install-mihomo-bypass-router.sh metacubexd-server-pi.tar.gz README-pi.md >SHA256SUMS
+  sha256sum install-mihomo-bypass-router.sh aio-ab-upgrade.sh metacubexd-server-pi.tar.gz README-pi.md >SHA256SUMS
   sha256sum -c SHA256SUMS
 )
 chmod 0644 "$BUNDLE_DIR/SHA256SUMS"

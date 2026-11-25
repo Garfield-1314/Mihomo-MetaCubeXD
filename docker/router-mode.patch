@@ -1,5 +1,5 @@
 diff --git a/apps/server/lib/__tests__/supervisor.spec.ts b/apps/server/lib/__tests__/supervisor.spec.ts
-index d4de557e..3d32a6f0 100644
+index d4de557..3d32a6f 100644
 --- a/apps/server/lib/__tests__/supervisor.spec.ts
 +++ b/apps/server/lib/__tests__/supervisor.spec.ts
 @@ -41,6 +41,10 @@ describe('apps/server lib/supervisor', () => {
@@ -34,7 +34,7 @@ index d4de557e..3d32a6f0 100644
      process.env.DATA_DIR = '/data'
      process.env.MIHOMO_BIN = '/usr/local/bin/mihomo'
 diff --git a/apps/server/lib/supervisor.ts b/apps/server/lib/supervisor.ts
-index 201c7a35..649f402b 100644
+index 201c7a3..649f402 100644
 --- a/apps/server/lib/supervisor.ts
 +++ b/apps/server/lib/supervisor.ts
 @@ -12,6 +12,10 @@ export interface ServerEnv {
@@ -86,7 +86,7 @@ index 201c7a35..649f402b 100644
    return agentSingleton
  }
 diff --git a/apps/server/plugins/boot-kernel.ts b/apps/server/plugins/boot-kernel.ts
-index 8e4fbf7e..68b0325a 100644
+index 8e4fbf7..68b0325 100644
 --- a/apps/server/plugins/boot-kernel.ts
 +++ b/apps/server/plugins/boot-kernel.ts
 @@ -13,10 +13,22 @@ import { getAgent } from '../lib/supervisor'
@@ -116,7 +116,7 @@ index 8e4fbf7e..68b0325a 100644
        console.log(`[kernel] ${s.status}${s.pid ? ` (pid ${s.pid})` : ''}`),
      )
 diff --git a/packages/agent/src/http.test.ts b/packages/agent/src/http.test.ts
-index c2cafc67..b346a689 100644
+index c2cafc6..e772f43 100644
 --- a/packages/agent/src/http.test.ts
 +++ b/packages/agent/src/http.test.ts
 @@ -1,4 +1,5 @@
@@ -125,7 +125,7 @@ index c2cafc67..b346a689 100644
  import type { KernelState, ProfileMeta } from './types'
  import { Buffer } from 'node:buffer'
  import { mkdtempSync, readdirSync } from 'node:fs'
-@@ -106,7 +107,34 @@ function makeDeps(token?: string) {
+@@ -106,7 +107,35 @@ function makeDeps(token?: string) {
    }))
    const homeDir = mkdtempSync(join(tmpdir(), 'mcxd-http-'))
    const activeConfigPath = join(homeDir, 'active.yaml')
@@ -156,12 +156,13 @@ index c2cafc67..b346a689 100644
 +      meta.managedBy !== 'router',
 +    onSourceImported: vi.fn(async () => {}),
 +    onSourcesChanged: vi.fn(async () => fakeState({ status: 'running' })),
++    syncSource: vi.fn(async () => fakeState({ status: 'running' })),
 +    onSourceRefreshed: vi.fn(async () => {}),
 +  }
  }
  
  async function mount(deps: ReturnType<typeof makeDeps>) {
-@@ -334,6 +362,78 @@ describe('createControlRouter — profiles + SSE', () => {
+@@ -334,6 +363,78 @@ describe('createControlRouter — profiles + SSE', () => {
      )
    })
  
@@ -241,7 +242,7 @@ index c2cafc67..b346a689 100644
      const deps = makeDeps()
      deps.profiles.importFromUrl.mockRejectedValue(
 diff --git a/packages/agent/src/http.ts b/packages/agent/src/http.ts
-index 9a83313b..0c98ca4d 100644
+index 9a83313..94aa6ba 100644
 --- a/packages/agent/src/http.ts
 +++ b/packages/agent/src/http.ts
 @@ -1,6 +1,7 @@
@@ -429,11 +430,18 @@ index 9a83313b..0c98ca4d 100644
      }),
    )
    router.post(
-@@ -337,7 +451,21 @@ export function createControlRouter(deps: ControlRouterDeps): App {
+@@ -335,21 +449,44 @@ export function createControlRouter(deps: ControlRouterDeps): App {
+     defineEventHandler(async (event) => {
+       const id = getRouterParam(event, 'id')!
        // Pure refresh: re-fetch the remote subscription in place and return the
-       // updated meta. This does NOT touch the running config — pair it with
-       // activate, or use /refresh-and-activate for a combined apply (#2108).
+-      // updated meta. This does NOT touch the running config — pair it with
+-      // activate, or use /refresh-and-activate for a combined apply (#2108).
 -      return withSubscriptionHttpError(() => profiles.refresh(id))
++      // updated meta. Outside router mode this does NOT touch the running
++      // config — pair it with activate, or use /refresh-and-activate for a
++      // combined apply (#2108). Router sources are different: the provider is
++      // hot-reloaded in place (with a restart fallback), otherwise the running
++      // group would keep stale nodes until mihomo's own 24h tick.
 +      const meta = await withSubscriptionHttpError(() => profiles.refresh(id))
 +      if (routerController?.enabled && routerController.isSource(meta)) {
 +        try {
@@ -452,7 +460,17 @@ index 9a83313b..0c98ca4d 100644
      }),
    )
    // Combined refresh + apply: re-fetch the subscription, compose it into
-@@ -350,6 +478,10 @@ export function createControlRouter(deps: ControlRouterDeps): App {
+   // active.yaml, validate, and restart — the action users expect from "refresh
+-  // my subscription and make it take effect" (#2108). Returns both the refreshed
+-  // meta and the resulting KernelState. Kept separate from /refresh so the pure
+-  // re-fetch path keeps its stable ProfileMeta response shape.
++  // my subscription and make it take effect" (#2108). In router mode the source
++  // is a provider, so this hot-reloads it in place and only restarts on
++  // failure. Returns both the refreshed meta and the resulting KernelState.
++  // Kept separate from /refresh so the pure re-fetch path keeps its stable
++  // ProfileMeta response shape.
+   router.post(
+     `${PREFIX}/profiles/:id/refresh-and-activate`,
      defineEventHandler(async (event) => {
        const id = getRouterParam(event, 'id')!
        const meta = await withSubscriptionHttpError(() => profiles.refresh(id))
@@ -463,7 +481,7 @@ index 9a83313b..0c98ca4d 100644
        const kernel = await safeActivate(id)
        return { meta, kernel }
      }),
-@@ -358,6 +490,22 @@ export function createControlRouter(deps: ControlRouterDeps): App {
+@@ -358,6 +495,22 @@ export function createControlRouter(deps: ControlRouterDeps): App {
      `${PREFIX}/profiles/:id/activate`,
      defineEventHandler(async (event) => {
        const id = getRouterParam(event, 'id')!
@@ -487,7 +505,7 @@ index 9a83313b..0c98ca4d 100644
      }),
    )
 diff --git a/packages/agent/src/index.ts b/packages/agent/src/index.ts
-index 6d05867e..0b47b81c 100644
+index 6d05867..63e5624 100644
 --- a/packages/agent/src/index.ts
 +++ b/packages/agent/src/index.ts
 @@ -1,3 +1,4 @@
@@ -503,7 +521,7 @@ index 6d05867e..0b47b81c 100644
  import { createProfileScheduler } from './scheduler'
  import { createScriptRunner } from './script'
  import { createSupervisor } from './supervisor'
-@@ -37,6 +39,23 @@ export type {
+@@ -37,6 +39,24 @@ export type {
  export { createProfileStore } from './profiles'
  export { applyActiveRefresh } from './refresh-apply'
  export type { ApplyActiveRefreshOptions } from './refresh-apply'
@@ -523,11 +541,12 @@ index 6d05867e..0b47b81c 100644
 +  RouterModeOptions,
 +  RouterRenderOptions,
 +  RouterSourceSpec,
++  RouterSyncOptions,
 +} from './router'
  export { createProfileScheduler } from './scheduler'
  export type {
    ProfileRefreshResult,
-@@ -65,6 +84,9 @@ export type CreateAgentOptions = CreateSupervisorOptions & {
+@@ -65,6 +85,9 @@ export type CreateAgentOptions = CreateSupervisorOptions & {
    systemProxy?: SystemProxyController // OS proxy controller; enables 'system-proxy'
    kernelManager?: KernelManager // kernel version mgmt; enables 'kernel-version'
    tunController?: TunController // TUN mode controller; enables 'tun'
@@ -537,7 +556,7 @@ index 6d05867e..0b47b81c 100644
  }
  
  export interface AgentInfo {
-@@ -85,6 +107,15 @@ export function createAgent(opts: CreateAgentOptions) {
+@@ -85,6 +108,15 @@ export function createAgent(opts: CreateAgentOptions) {
      scriptRunner: opts.scriptRunner ?? createScriptRunner(),
    })
    const supervisor = createSupervisor(opts)
@@ -553,7 +572,7 @@ index 6d05867e..0b47b81c 100644
    const profileEditor = createProfileConfigEditor({
      profiles,
      supervisor,
-@@ -120,6 +151,7 @@ export function createAgent(opts: CreateAgentOptions) {
+@@ -120,6 +152,7 @@ export function createAgent(opts: CreateAgentOptions) {
        ...(systemProxy ? ['system-proxy'] : []),
        ...(kernelManager ? ['kernel-version'] : []),
        ...(tunController ? ['tun'] : []),
@@ -561,7 +580,7 @@ index 6d05867e..0b47b81c 100644
      ],
    })
    const router = createControlRouter({
-@@ -133,6 +165,7 @@ export function createAgent(opts: CreateAgentOptions) {
+@@ -133,17 +166,28 @@ export function createAgent(opts: CreateAgentOptions) {
      systemProxy,
      kernelManager,
      tunController,
@@ -569,7 +588,31 @@ index 6d05867e..0b47b81c 100644
    })
    // Wire the auto-update scheduler to the same profiles store. NOT started here
    // — the server boot plugin starts it (the desktop builds its own scheduler so
-@@ -155,5 +188,6 @@ export function createAgent(opts: CreateAgentOptions) {
+   // it can surface per-refresh notifications, and does NOT start this one).
+   //
+-  // Validate and conditionally apply the active subscription before completing
+-  // its refresh result. The scheduler awaits this work and isolates failures.
++  // Router mode: a refreshed source must update its mihomo provider, not the
++  // active base (the base is the managed AIO Router profile). syncSource hot
++  // reloads the provider and falls back to a full restart when needed.
++  // Otherwise validate and conditionally apply the active subscription before
++  // completing its refresh result. The scheduler awaits this work and isolates
++  // failures.
+   const scheduler = createProfileScheduler({
+     profiles,
+     apply: (id) =>
+-      applyActiveRefresh(profiles, supervisor, id, { homeDir: opts.homeDir }),
++      routerController
++        ? routerController
++            .syncSource(id, { restartOnFallback: true })
++            .then(() => undefined)
++        : applyActiveRefresh(profiles, supervisor, id, {
++            homeDir: opts.homeDir,
++          }),
+   })
+   return {
+     supervisor,
+@@ -155,5 +199,6 @@ export function createAgent(opts: CreateAgentOptions) {
      systemProxy,
      kernelManager,
      tunController,
@@ -578,12 +621,19 @@ index 6d05867e..0b47b81c 100644
  }
 diff --git a/packages/agent/src/router.test.ts b/packages/agent/src/router.test.ts
 new file mode 100644
-index 00000000..a342f2b2
+index 0000000..1698b88
 --- /dev/null
 +++ b/packages/agent/src/router.test.ts
-@@ -0,0 +1,455 @@
+@@ -0,0 +1,642 @@
 +import type { KernelState, MihomoSupervisor } from './types'
-+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
++import {
++  mkdtemp,
++  readdir,
++  readFile,
++  rm,
++  utimes,
++  writeFile,
++} from 'node:fs/promises'
 +import { tmpdir } from 'node:os'
 +import { join } from 'node:path'
 +import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -619,6 +669,14 @@ index 00000000..a342f2b2
 +  - name: B-JP
 +    type: ss
 +    server: b.example.com
++    port: 8388
++    cipher: aes-128-gcm
++    password: secret
++`
++
++const SUB_A_PLUS = `${SUB_A}  - name: A-JP
++    type: ss
++    server: a3.example.com
 +    port: 8388
 +    cipher: aes-128-gcm
 +    password: secret
@@ -678,12 +736,33 @@ index 00000000..a342f2b2
 +  })
 +}
 +
++async function firstProviderFile(home: string): Promise<string> {
++  const [entry] = await readdir(join(home, 'providers'))
++  if (!entry) throw new Error('no provider cache written')
++  return join(home, 'providers', entry)
++}
++
 +function subscriptionFetch(body: string): typeof fetch {
 +  return (async () =>
 +    new Response(body, {
 +      status: 200,
 +      headers: { 'content-type': 'application/yaml' },
 +    })) as typeof fetch
++}
++
++function clashFetch(ok = true): {
++  impl: typeof fetch
++  calls: Array<{ url: string; method: string | undefined }>
++} {
++  const calls: Array<{ url: string; method: string | undefined }> = []
++  const impl = (async (
++    input: Parameters<typeof fetch>[0],
++    init?: Parameters<typeof fetch>[1],
++  ) => {
++    calls.push({ url: String(input), method: init?.method })
++    return new Response(null, { status: ok ? 204 : 500 })
++  }) as typeof fetch
++  return { impl, calls }
 +}
 +
 +describe('renderRouterConfig', () => {
@@ -1022,6 +1101,157 @@ index 00000000..a342f2b2
 +    expect(start).not.toHaveBeenCalled()
 +  })
 +
++  it('hot reloads a refreshed provider without restarting the kernel', async () => {
++    const home = await tempHome()
++    let payload = SUB_A
++    const profiles = await storeFor(
++      home,
++      (async () => new Response(payload, { status: 200 })) as typeof fetch,
++    )
++    const { supervisor, restart } = fakeSupervisor()
++    const api = clashFetch(true)
++    const controller = createRouterController({
++      enabled: true,
++      profiles,
++      supervisor,
++      homeDir: home,
++      fetch: api.impl,
++    })
++
++    const meta = await profiles.importFromUrl('https://example.com/a', 'Alpha')
++    await controller.onSourceImported(meta.id)
++    restart.mockClear()
++
++    // Make the profile copy (refresh time) newer than the provider cache so
++    // the mtime guard has to rewrite it.
++    const providerPath = await firstProviderFile(home)
++    const old = new Date(Date.now() - 60_000)
++    await utimes(providerPath, old, old)
++
++    payload = SUB_A_PLUS
++    await profiles.refresh(meta.id)
++    await controller.syncSource(meta.id)
++
++    expect(restart).not.toHaveBeenCalled()
++    expect(api.calls).toHaveLength(1)
++    expect(api.calls[0]?.method).toBe('PUT')
++    expect(api.calls[0]?.url).toContain('/providers/proxies/router_')
++    const provider = parse(await readFile(providerPath, 'utf8')) as Record<
++      string,
++      any
++    >
++    expect(provider.proxies).toHaveLength(3)
++  })
++
++  it('falls back to a kernel restart when the provider hot reload fails', async () => {
++    const home = await tempHome()
++    let payload = SUB_A
++    const profiles = await storeFor(
++      home,
++      (async () => new Response(payload, { status: 200 })) as typeof fetch,
++    )
++    const { supervisor, restart } = fakeSupervisor()
++    const api = clashFetch(false)
++    const controller = createRouterController({
++      enabled: true,
++      profiles,
++      supervisor,
++      homeDir: home,
++      fetch: api.impl,
++    })
++
++    const meta = await profiles.importFromUrl('https://example.com/a', 'Alpha')
++    await controller.onSourceImported(meta.id)
++    restart.mockClear()
++
++    const providerPath = await firstProviderFile(home)
++    const old = new Date(Date.now() - 60_000)
++    await utimes(providerPath, old, old)
++
++    payload = SUB_A_PLUS
++    await profiles.refresh(meta.id)
++    await controller.syncSource(meta.id)
++
++    expect(api.calls).toHaveLength(1)
++    expect(restart).toHaveBeenCalledOnce()
++    const provider = parse(await readFile(providerPath, 'utf8')) as Record<
++      string,
++      any
++    >
++    expect(provider.proxies).toHaveLength(3)
++  })
++
++  it('keeps the last good provider when the refreshed source has no proxies', async () => {
++    const home = await tempHome()
++    let payload = SUB_A
++    const profiles = await storeFor(
++      home,
++      (async () => new Response(payload, { status: 200 })) as typeof fetch,
++    )
++    const { supervisor, restart } = fakeSupervisor()
++    const api = clashFetch(true)
++    const controller = createRouterController({
++      enabled: true,
++      profiles,
++      supervisor,
++      homeDir: home,
++      fetch: api.impl,
++    })
++
++    const meta = await profiles.importFromUrl('https://example.com/a', 'Alpha')
++    await controller.onSourceImported(meta.id)
++    restart.mockClear()
++    const providerPath = await firstProviderFile(home)
++    const before = await readFile(providerPath, 'utf8')
++
++    payload = 'proxies: []\n'
++    await profiles.refresh(meta.id)
++    await controller.syncSource(meta.id)
++
++    expect(restart).not.toHaveBeenCalled()
++    expect(api.calls).toHaveLength(0)
++    expect(await readFile(providerPath, 'utf8')).toBe(before)
++  })
++
++  it('does not overwrite a provider cache newer than the profile copy', async () => {
++    const home = await tempHome()
++    const profiles = await storeFor(home, subscriptionFetch(SUB_A))
++    const { supervisor, restart } = fakeSupervisor()
++    const api = clashFetch(true)
++    const controller = createRouterController({
++      enabled: true,
++      profiles,
++      supervisor,
++      homeDir: home,
++      fetch: api.impl,
++    })
++
++    const meta = await profiles.importFromUrl('https://example.com/a', 'Alpha')
++    await controller.onSourceImported(meta.id)
++    restart.mockClear()
++
++    const providerPath = await firstProviderFile(home)
++    await writeFile(
++      providerPath,
++      `proxies:
++  - name: KERNEL-ONLY
++    type: ss
++    server: kernel.example.com
++    port: 8388
++    cipher: aes-128-gcm
++    password: secret
++`,
++    )
++    const future = new Date(Date.now() + 60_000)
++    await utimes(providerPath, future, future)
++
++    await controller.syncSource(meta.id)
++
++    expect(api.calls).toHaveLength(0)
++    expect(restart).not.toHaveBeenCalled()
++    expect(await readFile(providerPath, 'utf8')).toContain('KERNEL-ONLY')
++  })
++
 +  it('leaves a fresh install untouched until the first import', async () => {
 +    const home = await tempHome()
 +    const profiles = await storeFor(home)
@@ -1039,10 +1269,10 @@ index 00000000..a342f2b2
 +})
 diff --git a/packages/agent/src/router.ts b/packages/agent/src/router.ts
 new file mode 100644
-index 00000000..45fa5621
+index 0000000..5eafa07
 --- /dev/null
 +++ b/packages/agent/src/router.ts
-@@ -0,0 +1,558 @@
+@@ -0,0 +1,720 @@
 +// packages/agent/src/router.ts
 +import type {
 +  KernelState,
@@ -1057,6 +1287,7 @@ index 00000000..45fa5621
 +  readdir,
 +  rename,
 +  rm,
++  stat,
 +  writeFile,
 +} from 'node:fs/promises'
 +import { join } from 'node:path'
@@ -1097,6 +1328,8 @@ index 00000000..45fa5621
 +  profiles: ProfileStore
 +  supervisor: MihomoSupervisor
 +  homeDir: string
++  /** Injectable for tests; defaults to the global fetch. */
++  fetch?: typeof fetch
 +}
 +
 +export interface RouterSourceSpec {
@@ -1115,6 +1348,14 @@ index 00000000..45fa5621
 +  providerIntervalSec?: number
 +}
 +
++export interface RouterSyncOptions {
++  /**
++   * Restart the kernel when the in-place provider reload fails. Defaults to
++   * true: a failed hot reload must not leave the running kernel on stale nodes.
++   */
++  restartOnFallback?: boolean
++}
++
 +export interface RouterController {
 +  readonly enabled: boolean
 +  /** Prepare the managed base before the kernel starts (no restart). */
@@ -1127,16 +1368,32 @@ index 00000000..45fa5621
 +  onSourceImported: (id: string) => Promise<void>
 +  /** Rebuild provider files/base and activate. Used after enable/disable/delete. */
 +  onSourcesChanged: () => Promise<KernelState | undefined>
++  /**
++   * Rebuild one source's provider cache and hot-reload it through the Clash
++   * API. Falls back to a full rebuild + kernel restart when the hot reload
++   * fails, so a running kernel never stays on stale nodes.
++   */
++  syncSource: (
++    id: string,
++    options?: RouterSyncOptions,
++  ) => Promise<KernelState | undefined>
 +  /** Rebuild the cache/base after a manual subscription refresh. */
 +  onSourceRefreshed: (id: string) => Promise<void>
 +}
 +
 +type SourceSnapshot = RouterSourceSpec
 +
++interface ProviderFile {
++  content: string
++  /** Profile updatedAt, used to avoid overwriting a newer kernel cache. */
++  updatedAt: number
++  type: 'remote' | 'local'
++}
++
 +interface RouterSnapshot {
 +  base?: ProfileMeta
 +  sources: SourceSnapshot[]
-+  providerFiles: Map<string, string>
++  providerFiles: Map<string, ProviderFile>
 +  // Provider caches to leave on disk when a remote refresh returned unusable
 +  // content. The base still references the provider URL, so mihomo can retry
 +  // without dropping the last good nodes.
@@ -1356,6 +1613,7 @@ index 00000000..45fa5621
 +    baseName = ROUTER_BASE_NAME,
 +    providerIntervalSec = DEFAULT_PROVIDER_INTERVAL_SEC,
 +  } = opts
++  const doFetch = opts.fetch ?? fetch
 +  const providersDir = join(homeDir, PROVIDERS_DIR)
 +
 +  // Router mutations rebuild several files, so serialize them. Without this,
@@ -1389,7 +1647,7 @@ index 00000000..45fa5621
 +    )
 +    const names = uniqueNames(candidates)
 +    const sources: SourceSnapshot[] = []
-+    const providerFiles = new Map<string, string>()
++    const providerFiles = new Map<string, ProviderFile>()
 +    const preservedProviders = new Set<string>()
 +
 +    for (const meta of candidates) {
@@ -1410,8 +1668,15 @@ index 00000000..45fa5621
 +        type: sourceType(meta),
 +        ...(meta.url ? { url: meta.url } : {}),
 +      })
-+      if (proxies) providerFiles.set(providerName, stringify({ proxies }))
-+      else preservedProviders.add(providerName)
++      if (proxies) {
++        providerFiles.set(providerName, {
++          content: stringify({ proxies }),
++          updatedAt: meta.updatedAt,
++          type: sourceType(meta),
++        })
++      } else {
++        preservedProviders.add(providerName)
++      }
 +    }
 +
 +    return {
@@ -1429,9 +1694,9 @@ index 00000000..45fa5621
 +  }
 +
 +  async function writeProviderFiles(
-+    providerFiles: Map<string, string>,
++    providerFiles: Map<string, ProviderFile>,
 +    preservedProviders: Set<string>,
-+  ): Promise<void> {
++  ): Promise<Set<string>> {
 +    await mkdir(providersDir, { recursive: true })
 +    const desired = new Set(
 +      [...providerFiles.keys()].map((name) => `${name}.yaml`),
@@ -1444,9 +1709,25 @@ index 00000000..45fa5621
 +      if (desired.has(entry) || preserved.has(entry)) continue
 +      await rm(join(providersDir, entry), { force: true })
 +    }
-+    for (const [name, content] of providerFiles) {
-+      await atomicWrite(join(providersDir, `${name}.yaml`), content)
++
++    // Track what actually changed so the caller can hot-reload only the
++    // providers whose cache was rewritten.
++    const written = new Set<string>()
++    for (const [name, file] of providerFiles) {
++      const path = join(providersDir, `${name}.yaml`)
++      if (file.type === 'remote') {
++        // mihomo owns the HTTP provider cache. When it fetched the URL more
++        // recently than the profile copy, leave that cache alone: overwriting
++        // it would roll nodes back and reset mihomo's 24h refresh timer.
++        const current = await stat(path).catch(() => undefined)
++        if (current && current.size > 0 && current.mtimeMs > file.updatedAt) {
++          continue
++        }
++      }
++      await atomicWrite(path, file.content)
++      written.add(name)
 +    }
++    return written
 +  }
 +
 +  async function ensureBase(
@@ -1489,6 +1770,46 @@ index 00000000..45fa5621
 +    const status = supervisor.getState().status
 +    if (status === 'stopped' || status === 'errored') return supervisor.start()
 +    return supervisor.restart()
++  }
++
++  // The supervisor injects external-controller as a bind address (often
++  // 0.0.0.0). Clients must connect over loopback, not the wildcard bind address.
++  function controllerBaseUrl(address: string): string | undefined {
++    const withScheme = address.startsWith('http') ? address : `http://${address}`
++    try {
++      const url = new URL(withScheme)
++      const wildcard = new Set(['0.0.0.0', '::', '[::]', ''])
++      if (wildcard.has(url.hostname)) url.hostname = '127.0.0.1'
++      return url.origin
++    } catch {
++      return undefined
++    }
++  }
++
++  // Force mihomo to re-read one proxy provider in place. This keeps live
++  // connections and updates the running groups without a kernel restart.
++  async function reloadProvider(name: string): Promise<boolean> {
++    const state = supervisor.getState()
++    if (state.status !== 'running') return false
++    const base = controllerBaseUrl(state.externalController)
++    if (!base) return false
++    try {
++      const response = await doFetch(
++        `${base}/providers/proxies/${encodeURIComponent(name)}`,
++        {
++          method: 'PUT',
++          headers: state.secret
++            ? { Authorization: `Bearer ${state.secret}` }
++            : undefined,
++          signal: AbortSignal.timeout(30_000),
++        },
++      )
++      // Release the body even though the success response is normally empty.
++      await response.arrayBuffer().catch(() => undefined)
++      return response.ok
++    } catch {
++      return false
++    }
 +  }
 +
 +  async function applySnapshot(
@@ -1552,6 +1873,74 @@ index 00000000..45fa5621
 +    return supervisor.getState()
 +  }
 +
++  async function syncSourceImpl(
++    id: string,
++    options: RouterSyncOptions = {},
++  ): Promise<KernelState | undefined> {
++    const restartOnFallback = options.restartOnFallback !== false
++    const meta = (await profiles.list()).find((item) => item.id === id)
++    if (!meta) throw new Error(`[router] profile not found: ${id}`)
++    if (!isSourceType(meta) || meta.managedBy === 'router') {
++      throw new Error(`[router] profile is not a router source: ${id}`)
++    }
++    if (meta.enabled === false) return supervisor.getState()
++
++    const raw = await profiles.read(id)
++    const proxies = parseRouterSource(raw)
++    if (!proxies) {
++      // A corrupt remote refresh must keep the last good cache. mihomo still
++      // has the provider URL and will retry on its own schedule; restarting
++      // here would only drop connections for content we cannot parse.
++      console.warn(
++        `[router] source ${id} refresh produced no proxies; keeping the previous provider cache`,
++      )
++      return supervisor.getState()
++    }
++
++    const snapshot = await collectSnapshot()
++    if (!snapshot.base) {
++      // No managed base yet (for example a concurrent delete). Preserve the
++      // bootstrap semantics instead of writing an orphan provider cache.
++      return applySnapshot(`source ${id} synced`, {
++        restart: restartOnFallback,
++      })
++    }
++
++    const previous = await profiles.read(snapshot.base.id).catch(() => '')
++    const activeId = await profiles.getActiveId()
++    if (previous !== snapshot.content || activeId !== snapshot.base.id) {
++      // The source list, group names, or the active profile changed. Use the
++      // validated full path so the managed base and active.yaml stay in sync.
++      return applySnapshot(`source ${id} synced`, { restart: true })
++    }
++
++    const written = await writeProviderFiles(
++      snapshot.providerFiles,
++      snapshot.preservedProviders,
++    )
++    if (!written.size) {
++      // The kernel cache is already newer than the profile copy. Nothing to do.
++      return supervisor.getState()
++    }
++
++    // Reload every provider whose cache changed. Normally this is just the one
++    // source that refreshed, but a concurrent profile update can add another.
++    for (const name of written) {
++      if (await reloadProvider(name)) continue
++      if (!restartOnFallback) {
++        console.warn(
++          `[router] provider ${name} hot reload failed; keeping current nodes`,
++        )
++        return supervisor.getState()
++      }
++      console.warn(
++        `[router] provider ${name} hot reload failed; falling back to a kernel restart`,
++      )
++      return applySnapshot(`source ${id} fallback`, { restart: true })
++    }
++    return supervisor.getState()
++  }
++
 +  const controller: RouterController = {
 +    enabled: opts.enabled,
 +
@@ -1589,12 +1978,15 @@ index 00000000..45fa5621
 +      )
 +    },
 +
++    syncSource(id, options) {
++      return serialize(() => syncSourceImpl(id, options))
++    },
++
 +    onSourceRefreshed(id) {
 +      return serialize(async () => {
-+        // Manual refresh is rare; rebuild the provider cache and restart once.
-+        // Automatic 24h provider updates are handled inside mihomo and do NOT
-+        // restart the kernel.
-+        await applySnapshot(`source ${id} refreshed`, { restart: true })
++        // Manual refresh: write the new provider cache and hot-reload it. A
++        // failed hot reload still restarts so the invocation always applies.
++        await syncSourceImpl(id, { restartOnFallback: true })
 +      })
 +    },
 +  }
@@ -1602,7 +1994,7 @@ index 00000000..45fa5621
 +  return controller
 +}
 diff --git a/packages/agent/src/types.ts b/packages/agent/src/types.ts
-index 2bf5a635..2a641374 100644
+index 2bf5a63..2a64137 100644
 --- a/packages/agent/src/types.ts
 +++ b/packages/agent/src/types.ts
 @@ -109,7 +109,9 @@ export interface ProfileMeta {
@@ -1626,7 +2018,7 @@ index 2bf5a635..2a641374 100644
    }) => Promise<ProfileMeta>
    update: (
 diff --git a/packages/ui/components/OnboardingWizard.vue b/packages/ui/components/OnboardingWizard.vue
-index d70e8a7e..6a8dfed4 100644
+index d70e8a7..6a8dfed 100644
 --- a/packages/ui/components/OnboardingWizard.vue
 +++ b/packages/ui/components/OnboardingWizard.vue
 @@ -121,8 +121,12 @@ const onImported = async (meta: ProfileMeta) => {
@@ -1663,7 +2055,7 @@ index d70e8a7e..6a8dfed4 100644
                  </Button>
                </template>
 diff --git a/packages/ui/composables/__tests__/useControlApi.spec.ts b/packages/ui/composables/__tests__/useControlApi.spec.ts
-index a33f4498..d6aae171 100644
+index a33f449..d6aae17 100644
 --- a/packages/ui/composables/__tests__/useControlApi.spec.ts
 +++ b/packages/ui/composables/__tests__/useControlApi.spec.ts
 @@ -115,6 +115,7 @@ describe('composables/useControlApi methods', () => {
@@ -1724,7 +2116,7 @@ index a33f4498..d6aae171 100644
    })
  
 diff --git a/packages/ui/composables/__tests__/useTunConfig.spec.ts b/packages/ui/composables/__tests__/useTunConfig.spec.ts
-index 9477de21..2328cd24 100644
+index 9477de2..2328cd2 100644
 --- a/packages/ui/composables/__tests__/useTunConfig.spec.ts
 +++ b/packages/ui/composables/__tests__/useTunConfig.spec.ts
 @@ -263,18 +263,22 @@ describe('composables/useTunConfig', () => {
@@ -1755,7 +2147,7 @@ index 9477de21..2328cd24 100644
      expect(normalizeTunStack(undefined)).toBe('Mixed')
      expect(normalizeTunStack('')).toBe('Mixed')
 diff --git a/packages/ui/composables/useControlApi.ts b/packages/ui/composables/useControlApi.ts
-index 0c683d22..4a61e36b 100644
+index 0c683d2..4a61e36 100644
 --- a/packages/ui/composables/useControlApi.ts
 +++ b/packages/ui/composables/useControlApi.ts
 @@ -22,7 +22,9 @@ import ky from 'ky'
@@ -1812,7 +2204,7 @@ index 0c683d22..4a61e36b 100644
      duplicateProfile: (id: string, name?: string) =>
        client
 diff --git a/packages/ui/composables/useProfiles.ts b/packages/ui/composables/useProfiles.ts
-index 19569a84..4f21a711 100644
+index 19569a8..4f21a71 100644
 --- a/packages/ui/composables/useProfiles.ts
 +++ b/packages/ui/composables/useProfiles.ts
 @@ -32,7 +32,13 @@ export function useProfiles() {
@@ -1860,7 +2252,7 @@ index 19569a84..4f21a711 100644
      load,
      validate,
 diff --git a/packages/ui/composables/useTunConfig.ts b/packages/ui/composables/useTunConfig.ts
-index 1d788a12..3ff6950e 100644
+index 1d788a1..3ff6950 100644
 --- a/packages/ui/composables/useTunConfig.ts
 +++ b/packages/ui/composables/useTunConfig.ts
 @@ -10,13 +10,18 @@ declare function useI18n(): { t: (key: string, named?: object) => string }
@@ -1884,7 +2276,7 @@ index 1d788a12..3ff6950e 100644
  }
  
 diff --git a/packages/ui/i18n/locales/en.json b/packages/ui/i18n/locales/en.json
-index 2d45d436..4d0149af 100644
+index 2d45d43..4d0149a 100644
 --- a/packages/ui/i18n/locales/en.json
 +++ b/packages/ui/i18n/locales/en.json
 @@ -613,6 +613,13 @@
@@ -1902,7 +2294,7 @@ index 2d45d436..4d0149af 100644
    "profilesActivated": "Profile activated",
    "profilesActionFailed": "Action failed",
 diff --git a/packages/ui/i18n/locales/fa.json b/packages/ui/i18n/locales/fa.json
-index 753b0b5a..7df2b107 100644
+index 753b0b5..7df2b10 100644
 --- a/packages/ui/i18n/locales/fa.json
 +++ b/packages/ui/i18n/locales/fa.json
 @@ -613,6 +613,13 @@
@@ -1920,7 +2312,7 @@ index 753b0b5a..7df2b107 100644
    "profilesActivated": "نمایه فعال شد",
    "profilesActionFailed": "عملیات ناموفق بود",
 diff --git a/packages/ui/i18n/locales/fr.json b/packages/ui/i18n/locales/fr.json
-index 89a55179..967a9e6a 100644
+index 89a5517..967a9e6 100644
 --- a/packages/ui/i18n/locales/fr.json
 +++ b/packages/ui/i18n/locales/fr.json
 @@ -613,6 +613,13 @@
@@ -1938,7 +2330,7 @@ index 89a55179..967a9e6a 100644
    "profilesActivated": "Profil activé",
    "profilesActionFailed": "Échec de l'opération",
 diff --git a/packages/ui/i18n/locales/ja.json b/packages/ui/i18n/locales/ja.json
-index 17f6ff49..fcdd04c4 100644
+index 17f6ff4..fcdd04c 100644
 --- a/packages/ui/i18n/locales/ja.json
 +++ b/packages/ui/i18n/locales/ja.json
 @@ -613,6 +613,13 @@
@@ -1956,7 +2348,7 @@ index 17f6ff49..fcdd04c4 100644
    "profilesActivated": "プロファイルを有効化しました",
    "profilesActionFailed": "操作に失敗しました",
 diff --git a/packages/ui/i18n/locales/ko.json b/packages/ui/i18n/locales/ko.json
-index 0112c9b5..68302622 100644
+index 0112c9b..6830262 100644
 --- a/packages/ui/i18n/locales/ko.json
 +++ b/packages/ui/i18n/locales/ko.json
 @@ -613,6 +613,13 @@
@@ -1974,7 +2366,7 @@ index 0112c9b5..68302622 100644
    "profilesActivated": "프로필을 활성화했습니다",
    "profilesActionFailed": "작업에 실패했습니다",
 diff --git a/packages/ui/i18n/locales/ru.json b/packages/ui/i18n/locales/ru.json
-index a923938a..5b9285a6 100644
+index a923938..5b9285a 100644
 --- a/packages/ui/i18n/locales/ru.json
 +++ b/packages/ui/i18n/locales/ru.json
 @@ -557,6 +557,13 @@
@@ -1992,7 +2384,7 @@ index a923938a..5b9285a6 100644
    "profilesActivated": "Профиль активирован",
    "profilesActionFailed": "Не удалось выполнить действие",
 diff --git a/packages/ui/i18n/locales/zh.json b/packages/ui/i18n/locales/zh.json
-index 5c081956..188769ae 100644
+index 5c08195..188769a 100644
 --- a/packages/ui/i18n/locales/zh.json
 +++ b/packages/ui/i18n/locales/zh.json
 @@ -613,6 +613,13 @@
@@ -2010,7 +2402,7 @@ index 5c081956..188769ae 100644
    "profilesActivated": "配置已激活",
    "profilesActionFailed": "操作失败",
 diff --git a/packages/ui/pages/profiles.vue b/packages/ui/pages/profiles.vue
-index c0d90955..6c02325a 100644
+index c0d9095..6c02325 100644
 --- a/packages/ui/pages/profiles.vue
 +++ b/packages/ui/pages/profiles.vue
 @@ -18,6 +18,8 @@ import { controlErrorMessage } from '~/utils/controlError'
@@ -2183,7 +2575,7 @@ index c0d90955..6c02325a 100644
                :icon="IconTrash"
                :loading="isBusy(`delete:${p.id}`)"
 diff --git a/packages/ui/types/control.ts b/packages/ui/types/control.ts
-index 5f4be21f..d182b164 100644
+index 5f4be21..d182b16 100644
 --- a/packages/ui/types/control.ts
 +++ b/packages/ui/types/control.ts
 @@ -39,7 +39,7 @@ export interface ProfileMeta {

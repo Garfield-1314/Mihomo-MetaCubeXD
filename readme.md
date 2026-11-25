@@ -357,7 +357,7 @@ http://<LAN_IP>:8080
 - 节点名带订阅前缀，避免重名
 - 不需要修改分组或规则
 - 某个订阅更新失败时，mihomo 保留上一次可用节点，其他订阅不受影响
-- 订阅节点由内核每 24 小时自动更新，不重启内核
+- 订阅节点由内核每 24 小时自动更新；服务端刷新订阅后会把新节点热更新到对应 provider，热更新失败才回退重启内核
 
 不同订阅的节点会汇总到同一套路由器分组里。机场自带的 `proxy-groups` / `rules`
 不会带过来，这是聚合模式的取舍。
@@ -472,7 +472,42 @@ git -C mihomo checkout v1.19.27   # 改成目标版本
 sudo bash install-mihomo-bypass-router.sh --rebuild
 ```
 
-### 覆盖升级镜像
+### A/B 升级（推荐）
+
+新版镜像先加载到备用槽位，完成预检后切换；切换后宿主机自检 90 秒，失败自动回滚。
+
+```bash
+# 1. 上传新 bundle 到 Pi 后解压
+tar -xzf metacubexd-pi-<version>.tar.gz
+cd metacubexd-pi-<version>
+
+# 2. 校验
+sha256sum -c SHA256SUMS
+
+# 3. 后台执行 A/B 升级（SSH 断开也会继续）
+sudo bash aio-ab-upgrade.sh \
+  --archive metacubexd-server-pi.tar.gz --detach
+
+# 4. 查看进度
+sudo journalctl -u metacubexd-ab-upgrade -f
+cat /opt/metacubexd/ab/active-slot
+```
+
+自检内容：控制面健康、内核 running/PID 稳定、TUN `Meta`、`ip rule` 9000/9001/9002、
+`table 2022`、DNS fake-ip、代理 204、独立 netns 客户端真实路径、provider 节点数、关键错误日志。
+30 秒 warm-up 后连续 9 次采样全部通过才算成功；连续 3 次失败或出现 fatal 日志会回滚。
+
+升级前会备份 `.env`、compose 和数据卷到 `/opt/metacubexd/backups/pre-upgrade-*.tar.gz`。
+回滚使用旧槽位镜像 + 备份数据；如果升级中掉电/重启，`metacubexd-upgrade-recover.service`
+会在开机时检测未完成标记并自动回滚。
+
+只验证当前部署、不切换：
+
+```bash
+sudo /opt/metacubexd/aio-ab-upgrade.sh --self-test-only
+```
+
+### 传统覆盖升级（仅首次安装或 A/B 不可用时）
 
 保留已有 `.env` 和 `metacubexd-data` 卷，直接加载新镜像并重建容器：
 
@@ -488,7 +523,7 @@ sudo bash install-mihomo-bypass-router.sh \
 - 不会删除 `/data` 卷
 - 不要在升级时执行 `docker compose down -v` 或 `docker volume rm`
 
-回滚：
+手动回滚：
 
 ```bash
 sudo docker rm -f metacubexd

@@ -272,7 +272,7 @@ fi
 # something is actually missing: some Pi images point at an unreleased Ubuntu
 # suite, and a failing apt-get update must not block an otherwise valid upgrade.
 need_packages=0
-for cmd in curl openssl git ip iptables gzip; do
+for cmd in curl openssl git ip iptables gzip jq dig; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "Missing command: $cmd"
     need_packages=1
@@ -293,7 +293,7 @@ fi
 
 if [[ "$need_packages" == 1 ]]; then
   apt-get update
-  PACKAGES=(ca-certificates curl openssl git iproute2 iptables gzip)
+  PACKAGES=(ca-certificates curl openssl git iproute2 iptables gzip jq dnsutils)
   if [[ "$DISABLE_WIFI" == 1 ]]; then
     PACKAGES+=(rfkill)
   fi
@@ -375,7 +375,9 @@ fi
 
 if [[ "$IS_WSL" != true ]]; then
   if [[ ! -c /dev/net/tun ]]; then
-    command -v modprobe >/dev/null 2>&1 && modprobe tun || true
+    if command -v modprobe >/dev/null 2>&1; then
+      modprobe tun || true
+    fi
   fi
   if [[ ! -c /dev/net/tun ]]; then
     die "missing /dev/net/tun. Check that the Linux TUN module is available."
@@ -574,11 +576,20 @@ TZ=${TZ:-Asia/Shanghai}
 CONTROL_TOKEN=${CONTROL_TOKEN:-$(openssl rand -hex 32)}
 CLASH_SECRET=${CLASH_SECRET:-$(openssl rand -hex 32)}
 
+# A/B upgrade slots. Keep an existing active slot across installer re-runs;
+# upgrades themselves go through aio-ab-upgrade.sh, not this installer.
+AIO_SLOT_PREFIX=${AIO_SLOT_PREFIX:-$(read_env_value AIO_SLOT_PREFIX)}
+AIO_IMAGE=${AIO_IMAGE:-$(read_env_value AIO_IMAGE)}
+AIO_SLOT_PREFIX=${AIO_SLOT_PREFIX:-$IMAGE_TAG}
+AIO_IMAGE=${AIO_IMAGE:-$IMAGE_TAG}
+
 cat > "$APP_DIR/.env" <<EOF
 CONTROL_TOKEN=$CONTROL_TOKEN
 CLASH_SECRET=$CLASH_SECRET
 DEFAULT_BACKEND_URL=$DEFAULT_BACKEND_URL
 IMAGE_TAG=$IMAGE_TAG
+AIO_SLOT_PREFIX=$AIO_SLOT_PREFIX
+AIO_IMAGE=$AIO_IMAGE
 LAN_IP=$LAN_IP
 LAN_CIDR=$LAN_CIDR
 LAN_IFACE=$LAN_IFACE
@@ -589,6 +600,20 @@ HOST_DNS=$HOST_DNS
 TZ=$TZ
 EOF
 chmod 0600 "$APP_DIR/.env"
+
+# Host-side A/B upgrade helper. The Pi bundle ships it next to the installer;
+# a source checkout keeps it under scripts/. It is required for zero-build
+# upgrades and for the boot-time rollback service below.
+AB_SCRIPT_SRC="$REPO_DIR/scripts/aio-ab-upgrade.sh"
+if [[ ! -f "$AB_SCRIPT_SRC" && -f "$REPO_DIR/aio-ab-upgrade.sh" ]]; then
+  AB_SCRIPT_SRC="$REPO_DIR/aio-ab-upgrade.sh"
+fi
+if [[ -f "$AB_SCRIPT_SRC" ]]; then
+  install -m 0755 "$AB_SCRIPT_SRC" "$APP_DIR/aio-ab-upgrade.sh"
+  echo "A/B upgrade helper: $APP_DIR/aio-ab-upgrade.sh"
+else
+  warn "aio-ab-upgrade.sh not found; A/B upgrades are unavailable"
+fi
 
 # ---------------------------------------------------------------------------
 # Build or select the image
@@ -644,7 +669,7 @@ if [[ "$IS_WSL" == true ]]; then
   cat > "$APP_DIR/compose.yaml" <<'EOF'
 services:
   metacubexd:
-    image: ${IMAGE_TAG}
+    image: ${AIO_IMAGE}
     container_name: metacubexd
     restart: unless-stopped
     ports:
@@ -679,7 +704,7 @@ else
   cat > "$APP_DIR/compose.yaml" <<'EOF'
 services:
   metacubexd:
-    image: ${IMAGE_TAG}
+    image: ${AIO_IMAGE}
     container_name: metacubexd
     restart: unless-stopped
     network_mode: host
@@ -1061,6 +1086,26 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+  if [[ -x "$APP_DIR/aio-ab-upgrade.sh" ]]; then
+    cat > /etc/systemd/system/metacubexd-upgrade-recover.service <<EOF
+[Unit]
+Description=Roll back an interrupted MetaCubeXD A/B upgrade
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=900
+ExecStart=$APP_DIR/aio-ab-upgrade.sh --recover
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+
   cat > /usr/local/sbin/metacubexd-health.sh <<'EOF'
 #!/bin/sh
 set -u
@@ -1264,6 +1309,10 @@ EOF
   systemctl enable --now metacubexd-forward.timer || warn "could not enable forwarding timer"
   systemctl enable --now metacubexd-health.timer || warn "could not enable health timer"
   systemctl enable --now metacubexd-backup.timer || warn "could not enable backup timer"
+  if [[ -f /etc/systemd/system/metacubexd-upgrade-recover.service ]]; then
+    systemctl enable metacubexd-upgrade-recover.service ||
+      warn "could not enable the A/B upgrade recovery service"
+  fi
 
   if [[ "$HOST_DNS" == 1 && "$ROUTER_MODE" == 1 ]]; then
     systemctl enable --now metacubexd-host-dns.timer || warn "could not enable host DNS timer"
